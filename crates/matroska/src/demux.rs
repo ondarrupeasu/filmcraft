@@ -10,6 +10,9 @@ use crate::source::{ByteSource, ReadSeekSource};
 use crate::track::{Sample, Track, TrackKind, gcd};
 
 const WIN: usize = 64 * 1024;
+/// How much is read at a time while indexing every cluster: one large sequential read instead of
+/// one per block (a two-hour file is read end to end either way).
+const INDEX_FILL: usize = 4 << 20;
 /// Upper bound for level-1 metadata elements read into memory (Info, Tracks, Cues, Tags…).
 const MAX_META: u64 = 256 << 20;
 
@@ -136,6 +139,8 @@ struct Io<'a, S: ByteSource + ?Sized> {
     src: &'a S,
     len: u64,
     cache: &'a mut Cache,
+    /// Bytes read when the window misses ([`WIN`], or [`INDEX_FILL`] while indexing).
+    fill: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -165,7 +170,7 @@ impl Hdr {
 impl<'a, S: ByteSource + ?Sized> Io<'a, S> {
     fn new(src: &'a S, cache: &'a mut Cache) -> Self {
         let len = src.len();
-        Self { src, len, cache }
+        Self { src, len, cache, fill: WIN }
     }
 
     /// Up to `n` (≤ WIN) bytes at `pos` (fewer at EOF).
@@ -177,7 +182,7 @@ impl<'a, S: ByteSource + ?Sized> Io<'a, S> {
         let want_end = (pos + n as u64).min(self.len);
         let c = &*self.cache;
         if !(pos >= c.start && want_end <= c.start + c.buf.len() as u64) {
-            let fill = ((self.len - pos) as usize).min(WIN);
+            let fill = ((self.len - pos) as usize).min(self.fill.max(n));
             let mut buf = std::mem::take(&mut self.cache.buf);
             buf.resize(fill, 0);
             self.src.read_at(pos, &mut buf)?;
@@ -562,6 +567,9 @@ pub fn open_with<S: ByteSource>(src: S, opts: &OpenOptions) -> Result<MkvFile> {
 
 fn open_impl<S: ByteSource + ?Sized>(src: &S, opts: &OpenOptions, cache: &mut Cache) -> Result<MkvFile> {
     let mut io = Io::new(src, cache);
+    if opts.index {
+        io.fill = INDEX_FILL;
+    }
     let len = io.len;
     // EBML header (tolerate leading junk in the first 64 KiB)
     let start = {
@@ -622,16 +630,76 @@ fn open_impl<S: ByteSource + ?Sized>(src: &S, opts: &OpenOptions, cache: &mut Ca
     if seg.overruns(len) {
         file.warnings.push("Segment extends past end of file (truncated)".into());
     }
-    let mut w = Walker { opts, parsed: HashSet::new(), blocks_seen: false };
+    // The sample tables kept from an earlier open of this very file (see `index_cache`): only
+    // the metadata is read now, and the level-1 elements that were met among the clusters.
+    let kept_at = (opts.index && !opts.verify_crc).then(|| crate::index_cache::path_for(io.src)).flatten();
+    if let Some(path) = &kept_at
+        && let Some(kept) = crate::index_cache::load(path)
+    {
+        let meta = OpenOptions { index: false, verify_crc: false };
+        let mut w = Walker { opts: &meta, parsed: HashSet::new(), blocks_seen: false, level1_seen: Vec::new() };
+        io.fill = WIN;
+        w.walk(&mut io, &mut file)?;
+        let end = file.segment_end;
+        for &(id, pos) in &kept.level1 {
+            if !w.parsed.contains(&pos)
+                && let Some(h) = io.header(pos, end)?
+                && h.id == id
+            {
+                w.level1(&mut io, &mut file, &h, end)?;
+            }
+        }
+        file.cues.sort_by_key(|c| c.time);
+        if apply_kept(&mut file, kept) {
+            finish_tracks(&mut file);
+            return Ok(file);
+        }
+        // Not this file's after all: indexed again, from the start.
+        crate::index_cache::drop_file(path);
+        return open_impl(src, opts, cache);
+    }
+    let mut w = Walker { opts, parsed: HashSet::new(), blocks_seen: false, level1_seen: Vec::new() };
     w.walk(&mut io, &mut file)?;
     finish_tracks(&mut file);
+    if let Some(path) = &kept_at {
+        let kept = crate::index_cache::Kept {
+            clusters: file.clusters.clone(),
+            level1: w.level1_seen.clone(),
+            warnings: file.warnings.clone(),
+            tracks: file.tracks.iter().map(|t| (t.number, t.samples.clone())).collect(),
+        };
+        crate::index_cache::save(path, &kept);
+    }
     Ok(file)
+}
+
+/// The kept tables put into `file` (opened for its metadata only): false when they do not fit it
+/// (other tracks).
+fn apply_kept(file: &mut MkvFile, kept: crate::index_cache::Kept) -> bool {
+    if kept.tracks.len() != file.tracks.len() || kept.tracks.iter().zip(&file.tracks).any(|((n, _), t)| *n != t.number) {
+        return false;
+    }
+    for ((_, samples), t) in kept.tracks.into_iter().zip(file.tracks.iter_mut()) {
+        t.sync = samples.iter().enumerate().filter(|(_, s)| s.keyframe).map(|(i, _)| i as u32).collect();
+        t.samples = samples;
+    }
+    file.clusters = kept.clusters;
+    // Those of the metadata were met again; those of the clusters come from the full open.
+    for w in kept.warnings {
+        if !file.warnings.contains(&w) {
+            file.warnings.push(w);
+        }
+    }
+    file.indexed = true;
+    true
 }
 
 struct Walker<'o> {
     opts: &'o OpenOptions,
     parsed: HashSet<u64>,
     blocks_seen: bool,
+    /// The level-1 elements met as the walk went (id, position), kept with an index.
+    level1_seen: Vec<(u32, u64)>,
 }
 
 impl Walker<'_> {
@@ -670,6 +738,7 @@ impl Walker<'_> {
                     pos = ci.end.max(h.data_start());
                 }
                 SEEK_HEAD | INFO | TRACKS | CUES | CHAPTERS | TAGS | ATTACHMENTS => {
+                    self.level1_seen.push((h.id, h.pos));
                     pos = self.level1(io, file, &h, seg_end)?;
                 }
                 EBML | SEGMENT => break, // chained segment: only the first one is read

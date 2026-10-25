@@ -208,3 +208,21 @@ fn synthetic_file() {
     assert_eq!(d.next_packet().unwrap().unwrap().pts, 1120);
     assert!(d.file().indexed);
 }
+
+/// Opened again with an index cache, a file comes back as it was indexed the first time (from the
+/// kept tables), and a cache that does not fit its file is let go.
+#[test]
+fn a_kept_index_opens_the_same_file() {
+    let bytes = synthetic();
+    let fresh = crate::open(bytes.clone()).expect("fresh");
+    let dir = std::env::temp_dir().join(format!("fc-mkvidx-open-{}", std::process::id()));
+    crate::set_index_cache_dir(Some(dir.clone()));
+    let first = crate::open(bytes.clone()).expect("first");
+    let kept = crate::open(bytes.clone()).expect("kept");
+    let files: Vec<_> = std::fs::read_dir(&dir).expect("written").flatten().collect();
+    crate::set_index_cache_dir(None);
+    assert!(!files.is_empty(), "the index kept (other tests running meanwhile may keep theirs too)");
+    assert_eq!(format!("{fresh:?}"), format!("{first:?}"));
+    assert_eq!(format!("{fresh:?}"), format!("{kept:?}"), "the same from the kept tables");
+    let _ = std::fs::remove_dir_all(&dir);
+}
