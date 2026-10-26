@@ -63,13 +63,15 @@ fn basis() -> &'static Basis {
 
 fn analyze(b: &Basis, x: &[f32]) -> [f32; 256] {
     let mut out = [0f32; 256];
+    // Eight sums side by side, so the compiler can run them as one vector.
     for (k, o) in out.iter_mut().enumerate() {
-        let s = &b.s[k];
-        let mut acc = 0f32;
-        for n in 0..512 {
-            acc += s[n] * x[n];
+        let mut acc = [0f32; 8];
+        for (s, v) in b.s[k].chunks_exact(8).zip(x.chunks_exact(8)) {
+            for j in 0..8 {
+                acc[j] += s[j] * v[j];
+            }
         }
-        *o = acc * b.scale;
+        *o = acc.iter().sum::<f32>() * b.scale;
     }
     out
 }
@@ -399,19 +401,24 @@ impl Encoder {
                     if share { plan_exponents(&raw[c], end, st, lfe, true) } else { plan_one(&raw[c], end, st, lfe) }
                 })
                 .collect();
-            let (mut lo, mut hi) = (0i32, 1023i32);
+            // The side information alone (no mantissa has bits at offset 0), then the highest
+            // offset whose mantissas fit beside it.
             if self.write(&plans, &coefs, 0).is_none() {
                 if k + 1 < attempts.len() {
                     continue;
                 }
-                best = Some(self.write(&plans, &coefs, 0).unwrap_or_else(|| vec![0; self.frame_bytes]));
+                best = Some(vec![0; self.frame_bytes]);
                 break;
             }
+            let side = self.side_bits(&plans);
+            let budget = self.frame_bytes * 8 - 18;
+            let (mut lo, mut hi) = (0i32, 1023i32);
             while lo < hi {
                 let mid = (lo + hi + 1) / 2;
-                if self.write(&plans, &coefs, mid).is_some() { lo = mid } else { hi = mid - 1 }
+                if side + self.mantissa_bits(&plans, mid) <= budget { lo = mid } else { hi = mid - 1 }
             }
             best = self.write(&plans, &coefs, lo);
+            debug_assert!(best.is_some(), "the counted bits fit");
             break;
         }
         for buf in &mut self.buf {
@@ -419,6 +426,70 @@ impl Encoder {
         }
         self.frames += 1;
         best.unwrap_or_else(|| vec![0; self.frame_bytes])
+    }
+
+    /// The bits a frame's side information takes (everything but the mantissas).
+    fn side_bits(&self, plans: &[Exps]) -> usize {
+        let nf = self.map.len();
+        let mut bits = 40 + 5 + 3 + 3 + 1 + 5 + 3 + 2 + 3;
+        bits += 2 * (usize::from(self.acmod & 1 != 0 && self.acmod != 1) + usize::from(self.acmod & 4 != 0) + usize::from(self.acmod == 2));
+        for blk in 0..6 {
+            bits += 2 * nf + 1 + if blk == 0 { 2 } else { 1 };
+            if self.acmod == 2 {
+                bits += if blk == 0 { 5 } else { 1 };
+            }
+            bits += 2 * nf + usize::from(self.lfe);
+            for (c, p) in plans.iter().enumerate() {
+                if p.strategy[blk] != 0 {
+                    bits += 4 + 7 * p.coded[blk].1.len() + if c < nf { 6 + 2 } else { 0 };
+                }
+            }
+            bits += if blk == 0 { 1 + 11 + 1 + 6 + 7 * (nf + usize::from(self.lfe)) } else { 2 };
+            bits += 2;
+        }
+        bits
+    }
+
+    /// The bits the mantissas take at SNR offset `snr` (one allocation for each exponent set).
+    fn mantissa_bits(&self, plans: &[Exps], snr: i32) -> usize {
+        if snr == 0 {
+            return 0;
+        }
+        let nf = self.map.len();
+        let (csnr, fsnr) = (snr >> 4, snr & 15);
+        let g = Globals { fscod: usize::from(self.fscod), sdcycod: 2, fdcycod: 1, sgaincod: 1, dbpbcod: 2, floorcod: 7 };
+        let offset = (((csnr - 15) << 4) + fsnr) << 2;
+        // Per block: the mantissas of each grouped kind, and the others' bits.
+        let mut counts = [[0usize; 4]; 6];
+        for (c, p) in plans.iter().enumerate() {
+            let end = if c < nf { self.endmant } else { 7 };
+            let mut b0 = 0;
+            while b0 < 6 {
+                let b1 = (b0 + 1..6).find(|&b| p.strategy[b] != 0).unwrap_or(6);
+                let mut bap = [0u8; 256];
+                let ap = AllocParams { start: 0, end, fgain: FASTGAIN[4], snroffset: offset, leak: None, dba: None };
+                bit_allocation(&p.exps[b0], &ap, &g, &mut bap);
+                let mut k = [0usize; 4];
+                for &b in &bap[..end] {
+                    match b {
+                        0 => {}
+                        1 => k[0] += 1,
+                        2 => k[1] += 1,
+                        4 => k[2] += 1,
+                        3 => k[3] += 3,
+                        5 => k[3] += 4,
+                        b => k[3] += QNTZTAB[b as usize & 15] as usize,
+                    }
+                }
+                for cnt in counts.iter_mut().take(b1).skip(b0) {
+                    for j in 0..4 {
+                        cnt[j] += k[j];
+                    }
+                }
+                b0 = b1;
+            }
+        }
+        counts.iter().map(|k| k[0].div_ceil(3) * 5 + k[1].div_ceil(3) * 7 + k[2].div_ceil(2) * 7 + k[3]).sum()
     }
 
     /// The syncframe with SNR offset `snr` (csnroffst × 16 + fsnroffst), or none when it does
@@ -671,5 +742,18 @@ mod tests {
         let y: Vec<f32> = frames.iter().flat_map(|f| d.decode(f).unwrap().channels[0].clone()).collect();
         let peak = y[2000..8000].iter().fold(0f32, |a, v| a.max(v.abs()));
         assert!((peak - 0.999).abs() < 0.05, "peak {peak}");
+    }
+
+    /// How fast: a minute of 5.1 at 448 kb/s.
+    #[test]
+    #[ignore]
+    fn speed() {
+        let n = 48_000 * 60;
+        let input: Vec<Vec<f32>> = (0..6).map(|c| tone(n, 200.0 + 100.0 * c as f32, 0.3)).collect();
+        let mut e = Encoder::new(Config { sample_rate: 48_000, channels: 6, bitrate_kbps: 448 }).unwrap();
+        let t0 = std::time::Instant::now();
+        let mut frames = e.encode(&input);
+        frames.extend(e.flush());
+        println!("60 s of 5.1 in {:.2} s ({} frames)", t0.elapsed().as_secs_f64(), frames.len());
     }
 }
