@@ -1,0 +1,21 @@
+[package]
+name = "filmcraft-mpeg2enc"
+description = "Clean-room MPEG-2 video encoder (ITU-T H.262): 4:2:2 Profile at High Level, interlaced long GOP (XDCAM HD422 style), CBR with a VBV model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["threads"]
+threads = ["dep:rayon"]
+
+[dependencies]
+filmcraft-bitstream = { workspace = true }
+rayon = { workspace = true, optional = true }
+
+[dev-dependencies]
+filmcraft-mpeg2v = { workspace = true }

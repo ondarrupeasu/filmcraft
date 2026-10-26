@@ -2145,6 +2145,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "filmcraft-mpeg2enc"
+version = "0.9.0"
+dependencies = [
+ "filmcraft-bitstream",
+ "filmcraft-mpeg2v",
+ "rayon",
+]
+
+[[package]]
 name = "filmcraft-mpeg2v"
 version = "0.9.0"
 dependencies = [

@@ -40,6 +40,7 @@ filmcraft-flac = { path = "crates/flac" }
 filmcraft-opus = { path = "crates/opus" }
 filmcraft-h264enc = { path = "crates/h264enc" }
 filmcraft-avcintra = { path = "crates/avcintra" }
+filmcraft-mpeg2enc = { path = "crates/mpeg2enc" }
 filmcraft-audio-dsp = { path = "crates/audio-dsp" }
 filmcraft-frame = { path = "crates/frame" }
 filmcraft-media = { path = "crates/media" }
@@ -105,6 +106,9 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.filmcraft-avcintra]
+opt-level = 3
+
+[profile.dev.package.filmcraft-mpeg2enc]
 opt-level = 3
 
 [profile.dev.package.filmcraft-hevc]
