@@ -19,6 +19,7 @@ mod aac_out;
 mod audio_out;
 mod deflate;
 mod job;
+mod broadcast;
 mod mxf_out;
 mod pace;
 mod pcm;
@@ -337,6 +338,10 @@ pub struct ExportSettings {
     /// Video codec of the MXF formats (DNxHR unless set; the ProRes / DNxHR profile fields apply).
     #[serde(default)]
     pub mxf_video_codec: MxfVideoCodec,
+    /// MXF OP1a: every audio channel a sound track of its own (broadcast deliveries), not one
+    /// multichannel track.
+    #[serde(default)]
+    pub mxf_mono_tracks: bool,
     /// Encode display-referred SDR (Rec. 709, tone mapped) even when the sequence works in
     /// Rec. 2100 PQ/HLG. Otherwise H.264 and ProRes exports of an HDR sequence are encoded in the
     /// sequence's HDR space and signal it (VUI / `colr` / `mdcv` / `clli` / SEI).
@@ -562,6 +567,7 @@ impl Default for ExportSettings {
             dnx_profile: String::new(),
             apv_profile: String::new(),
             mxf_video_codec: MxfVideoCodec::default(),
+            mxf_mono_tracks: false,
             sdr: false,
             alpha: false,
             exr_compression: ExrCompression::None,

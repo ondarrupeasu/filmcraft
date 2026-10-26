@@ -139,23 +139,43 @@ pub enum MxfVideoCodec {
     ProRes,
     /// H.264 long GOP (ST 381-3 byte-stream mapping).
     H264,
+    /// AVC-Intra Class 100 (SMPTE RP 2027), 1080i25: H.264 High 4:2:2 Intra, 10-bit.
+    AvcIntra100,
+    /// XDCAM HD422: MPEG-2 4:2:2 Profile at High Level, long GOP, 50 Mbit/s, 1080i25 (ST 381-1).
+    Xdcam422,
 }
 
 impl MxfVideoCodec {
-    pub const ALL: [MxfVideoCodec; 3] = [MxfVideoCodec::Dnxhr, MxfVideoCodec::ProRes, MxfVideoCodec::H264];
+    pub const ALL: [MxfVideoCodec; 5] = [MxfVideoCodec::Dnxhr, MxfVideoCodec::ProRes, MxfVideoCodec::H264, MxfVideoCodec::AvcIntra100, MxfVideoCodec::Xdcam422];
     pub fn label(self) -> &'static str {
         match self {
             MxfVideoCodec::Dnxhr => "Avid DNxHR",
             MxfVideoCodec::ProRes => "Apple ProRes",
             MxfVideoCodec::H264 => "H.264",
+            MxfVideoCodec::AvcIntra100 => "AVC-Intra 100",
+            MxfVideoCodec::Xdcam422 => "XDCAM HD422",
         }
     }
-    /// The export format whose encoder this codec uses.
+    /// The export format whose encoder this codec uses (the broadcast codecs have their own,
+    /// made by the MXF export: Motion JPEG stands in for them where a format is asked).
     pub fn encoder_format(self) -> Format {
         match self {
             MxfVideoCodec::Dnxhr => Format::DnxHr,
             MxfVideoCodec::ProRes => Format::ProRes,
             MxfVideoCodec::H264 => Format::H264,
+            MxfVideoCodec::AvcIntra100 | MxfVideoCodec::Xdcam422 => Format::Mjpeg,
+        }
+    }
+    /// AVC-Intra 100 or XDCAM HD422: 1080i25 only, fixed bit rates.
+    pub fn is_broadcast(self) -> bool {
+        matches!(self, MxfVideoCodec::AvcIntra100 | MxfVideoCodec::Xdcam422)
+    }
+    /// The video bit rate of the broadcast codecs (AVC-Intra 100: 568 832 bytes a frame).
+    pub fn broadcast_bps(self) -> Option<f64> {
+        match self {
+            MxfVideoCodec::AvcIntra100 => Some(568_832.0 * 8.0 * 25.0),
+            MxfVideoCodec::Xdcam422 => Some(50e6),
+            _ => None,
         }
     }
 }
@@ -605,6 +625,7 @@ impl ExportSettings {
         let fps = r.rate.num as f64 / r.rate.den as f64;
         let px = r.width as f64 * r.height as f64;
         let video_bps = match self.video_format() {
+            _ if self.format.is_mxf() && self.mxf_video_codec.is_broadcast() => self.mxf_video_codec.broadcast_bps().unwrap_or(0.0),
             Format::Aac => 0.0,
             Format::H264 | Format::Hevc | Format::Av1 => r.target_kbps as f64 * 1000.0,
             Format::ProRes => crate::prores_profile(&self.prores_profile).nominal_mbps_1080p30() * 1e6 * px / (1920.0 * 1080.0) * fps / 29.97,
@@ -678,6 +699,12 @@ impl ExportSettings {
             let par = self.pixel_aspect.map(|(n, d)| format!("{:.2}", n.max(1) as f64 / d.max(1) as f64)).unwrap_or_else(|| "1.0".into());
             let mut v = format!("{}x{} ({par}), {} fps, {}", r.width, r.height, r.rate.label(), self.field_order.label());
             match self.video_format() {
+                _ if self.format.is_mxf() && self.mxf_video_codec == MxfVideoCodec::AvcIntra100 => {
+                    v += ", AVC-Intra Class 100 (High 4:2:2 Intra, 10-bit), interlaced, upper field first, 114 Mbit/s"
+                }
+                _ if self.format.is_mxf() && self.mxf_video_codec == MxfVideoCodec::Xdcam422 => {
+                    v += ", XDCAM HD422 (MPEG-2 422P@HL, long GOP 12), interlaced, upper field first, 50 Mbit/s CBR"
+                }
                 Format::H264 => {
                     v += &format!(
                         ", {} {}, {}",

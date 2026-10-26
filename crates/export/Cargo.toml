@@ -27,6 +27,8 @@ filmcraft-mxf = { workspace = true }
 filmcraft-aac = { workspace = true }
 filmcraft-flac = { workspace = true }
 filmcraft-h264enc = { workspace = true }
+filmcraft-avcintra = { workspace = true }
+filmcraft-mpeg2enc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

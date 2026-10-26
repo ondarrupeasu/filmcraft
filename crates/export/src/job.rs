@@ -206,6 +206,9 @@ pub(crate) fn hdr_output(working_hdr: bool, sdr: bool, format: Format, hdr_avail
 }
 
 fn make_venc(settings: &ExportSettings, w: u32, h: u32, rate: FrameRate) -> Result<Box<dyn VideoEncoder>> {
+    if let Some(e) = crate::broadcast::encoder(settings, w, h, rate) {
+        return e;
+    }
     video_factories()
         .read()
         .unwrap_or_else(|e| e.into_inner())

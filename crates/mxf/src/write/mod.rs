@@ -104,12 +104,19 @@ pub enum PictureCoding {
     ProRes { profile: u8 },
     /// H.264 / AVC Annex B byte stream; `profile_idc` from the SPS (66, 77, 100, …).
     Avc { profile_idc: u8, intra: bool },
+    /// AVC-Intra (SMPTE RP 2027) Class 100 1080/50i: H.264 High 4:2:2 Intra, its own coding label.
+    AvcIntra100,
+    /// MPEG-2 video 4:2:2 Profile at High Level, long GOP (XDCAM HD422), with the parameters of the
+    /// MPEG-2 video descriptor (SMPTE ST 381-1).
+    Mpeg2Hl422 { bit_rate: u32, max_gop: u16, b_pictures: u16, closed_gop: bool },
 }
 
 impl PictureCoding {
-    fn intra_only(&self) -> bool {
+    /// Every picture independently decodable.
+    pub fn intra_only(&self) -> bool {
         match self {
             PictureCoding::Avc { intra, .. } => *intra,
+            PictureCoding::Mpeg2Hl422 { .. } => false,
             _ => true,
         }
     }
@@ -142,6 +149,10 @@ impl PictureCoding {
                 };
                 [0x06, 0x0E, 0x2B, 0x34, 0x04, 0x01, 0x01, 0x0A, 0x04, 0x01, 0x02, 0x02, 0x01, b13, b14, 0x01]
             }
+            // H264MPEG4AVCHigh422IntraRP2027ConstrainedClass100108050iCoding
+            PictureCoding::AvcIntra100 => [0x06, 0x0E, 0x2B, 0x34, 0x04, 0x01, 0x01, 0x0A, 0x04, 0x01, 0x02, 0x02, 0x01, 0x32, 0x31, 0x02],
+            // MPEG2422PHLLongGOP
+            PictureCoding::Mpeg2Hl422 { .. } => [0x06, 0x0E, 0x2B, 0x34, 0x04, 0x01, 0x01, 0x03, 0x04, 0x01, 0x02, 0x02, 0x01, 0x04, 0x03, 0x00],
         }
     }
     /// (essence container label, element type) for frame or clip wrapping.
@@ -150,7 +161,9 @@ impl PictureCoding {
         match self {
             PictureCoding::Vc3 { .. } => (essence_container(0x0A, 0x11, w, 0x00), if clip { 0x0D } else { 0x0C }),
             PictureCoding::ProRes { .. } => (essence_container(0x0D, 0x1C, w, 0x00), if clip { 0x18 } else { 0x17 }),
-            PictureCoding::Avc { .. } => (essence_container(0x0A, 0x10, 0x60, w), if clip { 0x16 } else { 0x15 }),
+            PictureCoding::Avc { .. } | PictureCoding::AvcIntra100 => (essence_container(0x0A, 0x10, 0x60, w), if clip { 0x16 } else { 0x15 }),
+            // MPEG elementary stream, video stream 0 (ST 381-1)
+            PictureCoding::Mpeg2Hl422 { .. } => (essence_container(0x02, 0x04, 0x60, w), if clip { 0x06 } else { 0x05 }),
         }
     }
 }
@@ -179,6 +192,9 @@ pub struct PictureDesc {
     /// Chroma subsampling: (2, 1) 4:2:2, (2, 2) 4:2:0, (1, 1) 4:4:4.
     pub subsampling: (u32, u32),
     pub color: ColorSpace,
+    /// Interlaced, top field first: described as separate fields (ST 377-1 FrameLayout 1), the
+    /// heights a field's, with the line map of 1080-line video.
+    pub interlaced: bool,
 }
 
 impl PictureDesc {
@@ -188,6 +204,8 @@ impl PictureDesc {
         let g = gcd(width.max(1), height.max(1));
         let (depth, subsampling) = match coding {
             PictureCoding::Avc { .. } => (8, (2, 2)),
+            PictureCoding::AvcIntra100 => (10, (2, 1)),
+            PictureCoding::Mpeg2Hl422 { .. } => (8, (2, 1)),
             PictureCoding::ProRes { profile } => (if profile >= 5 { 12 } else { 10 }, if profile >= 5 { (1, 1) } else { (2, 1) }),
             PictureCoding::Vc3 { cid } => {
                 (if matches!(cid, 1235 | 1241 | 1250 | 1256 | 1270 | 1271) { 10 } else { 8 }, if matches!(cid, 1256 | 1270) { (1, 1) } else { (2, 1) })
@@ -201,6 +219,7 @@ impl PictureDesc {
             depth,
             subsampling,
             color: ColorSpace::Rec709,
+            interlaced: matches!(coding, PictureCoding::AvcIntra100 | PictureCoding::Mpeg2Hl422 { .. }),
         }
     }
 }
@@ -866,7 +885,12 @@ impl<W: Write + Seek> MxfWriter<W> {
                 TrackKind::Picture => {
                     // Picture tracks exist only with a picture configuration.
                     let Some(p) = cfg.picture.as_ref() else { continue };
-                    let mut s = Set::new(0x28, uid);
+                    let mpeg = match p.coding {
+                        PictureCoding::Mpeg2Hl422 { bit_rate, max_gop, b_pictures, closed_gop } => Some((bit_rate, max_gop, b_pictures, closed_gop)),
+                        _ => None,
+                    };
+                    // MPEG-2 video descriptor (ST 381-1) or CDCI
+                    let mut s = Set::new(if mpeg.is_some() { 0x51 } else { 0x28 }, uid);
                     if multiple {
                         s.u32(0x3006, t.id);
                     }
@@ -883,16 +907,23 @@ impl<W: Write + Seek> MxfWriter<W> {
                     let black = 16u32 << (depth - 8);
                     let white = 235u32 << (depth - 8);
                     let range = (225u32 << (depth - 8)) + 1;
+                    // a field's heights for interlaced video: stored as coded (macroblock rows),
+                    // sampled and displayed as the picture; lines 21 and 584 of 1080-line video
+                    let (layout, stored, shown, lines) = if p.interlaced {
+                        (1u8, p.height.div_ceil(32) * 16, p.height / 2, [21u32, 584])
+                    } else {
+                        (0u8, p.height, p.height, [0, 0])
+                    };
                     s.p(0x3004, &t.container)
-                        .u8(0x320C, 0)
+                        .u8(0x320C, layout)
                         .u32(0x3203, p.width)
-                        .u32(0x3202, p.height)
+                        .u32(0x3202, stored)
                         .u32(0x3205, p.width)
-                        .u32(0x3204, p.height)
+                        .u32(0x3204, shown)
                         .u32(0x3209, p.width)
-                        .u32(0x3208, p.height)
+                        .u32(0x3208, shown)
                         .rat(0x320E, p.aspect)
-                        .p(0x320D, &batch(&[&0u32.to_be_bytes(), &0u32.to_be_bytes()], 4))
+                        .p(0x320D, &batch(&[&lines[0].to_be_bytes(), &lines[1].to_be_bytes()], 4))
                         .p(0x3201, &p.coding.coding_label())
                         .p(0x3210, &tcl)
                         .p(0x321A, &ce)
@@ -903,6 +934,22 @@ impl<W: Write + Seek> MxfWriter<W> {
                         .u32(0x3304, black)
                         .u32(0x3305, white)
                         .u32(0x3306, range);
+                    if p.interlaced {
+                        s.u8(0x3212, 1); // FieldDominance: the first (top) field first
+                    }
+                    if let Some((bit_rate, max_gop, b_pictures, closed_gop)) = mpeg {
+                        // the dynamic tags of labels::PRIMER
+                        s.u8(0x8001, 1) // SingleSequence
+                            .u8(0x8002, 1) // ConstantBFrames
+                            .u8(0x8003, if p.interlaced { 2 } else { 1 }) // CodedContentType
+                            .u8(0x8004, 0) // LowDelay
+                            .u8(0x8005, u8::from(closed_gop)) // ClosedGOP
+                            .u8(0x8006, 1) // IdenticalGOP
+                            .u16(0x8007, max_gop) // MaxGOP
+                            .u16(0x8008, b_pictures) // BPictureCount
+                            .u8(0x8009, 0x82) // ProfileAndLevel: 4:2:2 Profile at High Level
+                            .u32(0x800A, bit_rate); // BitRate
+                    }
                     s.write(&mut out);
                 }
                 TrackKind::Sound(i) => {

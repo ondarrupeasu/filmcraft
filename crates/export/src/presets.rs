@@ -75,6 +75,8 @@ fn mxf(format: Format, codec: MxfVideoCodec, profile: &str) -> ExportSettings {
             s.adaptive_bitrate = Some(0.3);
             s.bitrate_mode = BitrateMode::Vbr1Pass;
         }
+        // fixed by the codec
+        MxfVideoCodec::AvcIntra100 | MxfVideoCodec::Xdcam422 => {}
     }
     s
 }

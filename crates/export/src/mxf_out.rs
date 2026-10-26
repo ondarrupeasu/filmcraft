@@ -2,6 +2,7 @@
 //! OP-Atom (Avid style: the picture in `path`, one mono PCM file per audio channel next to it,
 //! `<stem>_A1.mxf`, `<stem>_A2.mxf`, …), written with [`filmcraft_mxf::MxfWriter`].
 
+use crate::MxfVideoCodec;
 use filmcraft_mxf::{
     CodedKind, ColorSpace, FrameInfo, MxfWriter, PackageIds, Pattern, PictureCoding, PictureDesc, Rational, SoundDesc, StartTimecode, Timestamp, WriterConfig,
 };
@@ -31,6 +32,10 @@ fn io(e: std::io::Error) -> ExportError {
 /// The picture essence description for an export (codec from the MXF video codec setting).
 fn picture(settings: &ExportSettings, w: u32, h: u32) -> PictureDesc {
     let coding = match settings.video_format() {
+        _ if settings.mxf_video_codec == MxfVideoCodec::AvcIntra100 => PictureCoding::AvcIntra100,
+        _ if settings.mxf_video_codec == MxfVideoCodec::Xdcam422 => {
+            PictureCoding::Mpeg2Hl422 { bit_rate: 50_000_000, max_gop: 12, b_pictures: 2, closed_gop: false }
+        }
         Format::ProRes => {
             use filmcraft_prores::Profile;
             PictureCoding::ProRes {
@@ -91,6 +96,8 @@ pub(crate) struct MxfMux {
     /// OP-Atom: one writer per audio channel.
     audio: Vec<(String, MxfWriter<Out>)>,
     atom: bool,
+    /// OP1a with a sound track per channel.
+    mono: bool,
     bits: u32,
     channels: usize,
     /// Stored pictures so far, and the composition offset of the first (H.264 reorder delay).
@@ -115,7 +122,11 @@ impl MxfMux {
         cfg.modified = Timestamp::from_unix((now / 1_000_000_000) as i64);
         cfg.timecode = Some(StartTimecode { frames: s.timecode.0, rate, drop_frame: s.timecode.1 && s.rate.supports_drop_frame() });
         if !atom && let Some((sr, ch)) = s.audio {
-            cfg.sound = vec![SoundDesc { sample_rate: sr, channels: ch as u32, bits }];
+            cfg.sound = if settings.mxf_mono_tracks {
+                vec![SoundDesc { sample_rate: sr, channels: 1, bits }; ch]
+            } else {
+                vec![SoundDesc { sample_rate: sr, channels: ch as u32, bits }]
+            };
         }
         let mut audio = Vec::new();
         if atom && let Some((sr, ch)) = s.audio {
@@ -144,6 +155,7 @@ impl MxfMux {
             video,
             audio,
             atom,
+            mono: !atom && settings.mxf_mono_tracks,
             bits,
             channels: s.audio.map_or(0, |a| a.1),
             stored: 0,
@@ -155,7 +167,7 @@ impl MxfMux {
 
     pub fn write_video(&mut self, packets: Vec<EncodedPacket>) -> Result<()> {
         for p in packets {
-            let intra = !matches!(self.video.config().picture.as_ref().map(|p| p.coding), Some(PictureCoding::Avc { .. }));
+            let intra = self.video.config().picture.as_ref().is_none_or(|p| p.coding.intra_only());
             let info = if intra {
                 FrameInfo::intra()
             } else {
@@ -188,6 +200,11 @@ impl MxfMux {
                 if let Some(c) = planar.get(k) {
                     w.push_sound(0, &filmcraft_mxf::encode_pcm(std::slice::from_ref(c), self.bits)).map_err(io)?;
                 }
+            }
+            Ok(())
+        } else if self.mono {
+            for (k, c) in planar.iter().enumerate() {
+                self.video.push_sound(k, &filmcraft_mxf::encode_pcm(std::slice::from_ref(c), self.bits)).map_err(io)?;
             }
             Ok(())
         } else {

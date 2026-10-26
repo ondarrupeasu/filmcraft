@@ -86,14 +86,15 @@ fn codec_name(c: MxfVideoCodec) -> &'static str {
     match c {
         MxfVideoCodec::Dnxhr => "dnxhd",
         MxfVideoCodec::ProRes => "prores",
-        MxfVideoCodec::H264 => "h264",
+        MxfVideoCodec::H264 | MxfVideoCodec::AvcIntra100 => "h264",
+        MxfVideoCodec::Xdcam422 => "mpeg2video",
     }
 }
 
 #[test]
 fn op1a_reads_back_with_our_demuxer_and_decoders() {
     let (p, seq, m) = project();
-    for codec in MxfVideoCodec::ALL {
+    for codec in MxfVideoCodec::ALL.into_iter().filter(|c| !c.is_broadcast()) {
         let path = tmp(&format!("op1a_{codec:?}.mxf"));
         let r = export(&p, seq, &settings(Format::MxfOp1a, codec, &path), &m, &Progress::default()).unwrap();
         assert_eq!(r.frames, 24);
@@ -191,7 +192,7 @@ fn ffmpeg_oracle_op1a_and_op_atom() {
         return;
     };
     let (p, seq, m) = project();
-    for codec in MxfVideoCodec::ALL {
+    for codec in MxfVideoCodec::ALL.into_iter().filter(|c| !c.is_broadcast()) {
         let path = tmp(&format!("oracle_{codec:?}.mxf"));
         export(&p, seq, &settings(Format::MxfOp1a, codec, &path), &m, &Progress::default()).unwrap();
         let j = ffprobe_json(&ffprobe, &path);
@@ -260,5 +261,89 @@ fn ffmpeg_oracle_op1a_and_op_atom() {
         assert_eq!(mono.len(), 48_000 * 4, "{a}");
         let want: Vec<u8> = stereo.as_chunks::<8>().0.iter().flat_map(|f| f[k * 4..k * 4 + 4].to_vec()).collect();
         assert!(mono == want, "{a}: channel {k} differs from the WAV export");
+    }
+}
+
+/// 2 s at 25 fps, 1920×1080: colour bars over V1, a tone on A1, start timecode 00:00:00:00.
+fn hd_project() -> (Arc<Project>, ItemId, SourceMap) {
+    let mut p = Project::new("hd");
+    let r = FrameRate::FPS_25;
+    let bars = GeneratorSource::new(Generator::CountingLeader, 1920, 1080, r, Tick(3 * TICKS_PER_SECOND));
+    let tone = GeneratorSource::new(Generator::Tone { hz: 1000.0, db: -18.0 }, 1920, 1080, r, Tick(3 * TICKS_PER_SECOND));
+    let add = |p: &mut Project, g: &GeneratorSource| {
+        let info = g.info().clone();
+        p.add_item(
+            &info.name.clone(),
+            Label::Iris,
+            ItemKind::Media(MediaClip {
+                media: MediaRef::Generator(g.generator.clone()),
+                info,
+                interpret: Default::default(),
+                mark_in: None,
+                mark_out: None,
+                markers: vec![],
+                offline: false,
+                proxy: None,
+                identity: None,
+            }),
+            None,
+        )
+    };
+    let v = add(&mut p, &bars);
+    let a = add(&mut p, &tone);
+    let seq = p.new_sequence("EITB", SequenceSettings { width: 1920, height: 1080, frame_rate: r, ..Default::default() }, 1, 1, None);
+    let vi = p.make_track_item(v, TrackKind::Video, Tick::ZERO, TimeRange::new(Tick::ZERO, r.tick_of(50)), r).unwrap();
+    let ai = p.make_track_item(a, TrackKind::Audio, Tick::ZERO, TimeRange::new(Tick::ZERO, r.tick_of(50)), r).unwrap();
+    let q = p.sequence_mut(seq).unwrap();
+    q.video_tracks[0].items.push(vi);
+    q.audio_tracks[0].items.push(ai);
+    let mut m = SourceMap::default();
+    m.0.insert(v, Arc::new(bars));
+    m.0.insert(a, Arc::new(tone));
+    (Arc::new(p), seq, m)
+}
+
+/// AVC-Intra 100 and XDCAM HD422 in OP1a, a sound track per channel: our demuxer reads the
+/// 1080i25 picture and the mono tracks; ffprobe sees High 4:2:2 Intra / MPEG-2 4:2:2 interlaced,
+/// top field first, and ffmpeg decodes every frame.
+#[test]
+fn broadcast_hd_codecs_in_op1a() {
+    let (p, seq, m) = hd_project();
+    let ffprobe = filmcraft_testkit::ffprobe_or_skip("broadcast MXF probe");
+    let ffmpeg = filmcraft_testkit::ffmpeg_or_skip("broadcast MXF decode");
+    for codec in [MxfVideoCodec::AvcIntra100, MxfVideoCodec::Xdcam422] {
+        let path = tmp(&format!("hd_{codec:?}.mxf"));
+        let mut s = settings(Format::MxfOp1a, codec, &path);
+        s.mxf_mono_tracks = true;
+        let r = export(&p, seq, &s, &m, &Progress::default()).unwrap();
+        assert_eq!(r.frames, 50);
+        let bytes = std::fs::read(&path).unwrap();
+        let mx = filmcraft_mxf::open(&bytes).unwrap();
+        assert!(mx.warnings.is_empty(), "{codec:?}: {:?}", mx.warnings);
+        assert_eq!(mx.timecode.unwrap().format(), "00:00:00:00");
+        let v = &mx.tracks[mx.track_of_kind(filmcraft_mxf::TrackKind::Picture).unwrap()];
+        assert_eq!(v.samples.len(), 50, "{codec:?}");
+        let sounds: Vec<_> = mx.tracks.iter().filter(|t| t.kind == filmcraft_mxf::TrackKind::Sound).collect();
+        assert_eq!(sounds.len(), 2, "a track per channel");
+        assert!(sounds.iter().all(|t| t.sound.as_ref().unwrap().channels == 1 && t.stored_sample_frames() == 96_000));
+        if codec == MxfVideoCodec::AvcIntra100 {
+            assert!(v.samples.iter().all(|s| s.size == 568_832 && s.key), "fixed-size intra frames");
+        } else {
+            assert!(v.temporal_offsets, "B pictures: the index gives the display order");
+            assert_eq!(v.samples.iter().filter(|s| s.key).count(), 5, "an I picture every 12");
+        }
+        let (Some(ffprobe), Some(ffmpeg)) = (&ffprobe, &ffmpeg) else { continue };
+        let j = ffprobe_json(ffprobe, &path);
+        let streams = j["streams"].as_array().unwrap();
+        let vs = streams.iter().find(|s| s["codec_type"] == "video").unwrap();
+        assert_eq!(vs["codec_name"], codec_name(codec), "{codec:?}");
+        assert_eq!(vs["width"], 1920);
+        assert_eq!(vs["height"], 1080);
+        assert_eq!(vs["field_order"], "tt", "{codec:?}");
+        assert_eq!(vs["profile"], if codec == MxfVideoCodec::AvcIntra100 { "High 4:2:2 Intra" } else { "4:2:2" });
+        assert_eq!(vs["nb_read_frames"], "50", "{codec:?}");
+        assert_eq!(streams.iter().filter(|s| s["codec_type"] == "audio" && s["channels"] == 1).count(), 2);
+        let raw = ffmpeg_raw(ffmpeg, &path, "0:v", &["-f", "rawvideo", "-pix_fmt", "gray"]);
+        assert_eq!(raw.len(), 1920 * 1080 * 50, "{codec:?}: every frame decodes");
     }
 }
