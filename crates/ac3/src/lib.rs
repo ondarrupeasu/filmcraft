@@ -21,6 +21,8 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
 mod eac3;
+/// The encoder: AC-3 from planar samples (see its module).
+pub mod encode;
 mod tables;
 
 use std::sync::OnceLock;
