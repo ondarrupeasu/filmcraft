@@ -66,7 +66,7 @@ fn analyze(b: &Basis, x: &[f32]) -> [f32; 256] {
     // Eight sums side by side, so the compiler can run them as one vector.
     for (k, o) in out.iter_mut().enumerate() {
         let mut acc = [0f32; 8];
-        for (s, v) in b.s[k].chunks_exact(8).zip(x.chunks_exact(8)) {
+        for (s, v) in b.s[k].as_chunks::<8>().0.iter().zip(x.as_chunks::<8>().0) {
             for j in 0..8 {
                 acc[j] += s[j] * v[j];
             }
