@@ -1773,6 +1773,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "filmcraft-avcintra"
+version = "0.9.0"
+dependencies = [
+ "filmcraft-bitstream",
+ "rayon",
+]
+
+[[package]]
 name = "filmcraft-avi"
 version = "0.9.0"
 dependencies = [

@@ -1,0 +1,18 @@
+[package]
+name = "filmcraft-avcintra"
+description = "Clean-room AVC-Intra Class 100 encoder (H.264 High 4:2:2 Intra, 10-bit, CAVLC, 1080i field pictures, fixed frame size)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["threads"]
+threads = ["dep:rayon"]
+
+[dependencies]
+filmcraft-bitstream = { workspace = true }
+rayon = { workspace = true, optional = true }
