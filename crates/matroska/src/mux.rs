@@ -34,6 +34,10 @@ pub struct TrackSpec {
     pub audio: Option<(f64, u64, Option<u64>)>,
     pub codec_delay_ns: u64,
     pub seek_pre_roll_ns: u64,
+    /// `DisplayWidth`/`DisplayHeight` in pixels (anamorphic pictures), for video tracks.
+    pub display_size: Option<(u32, u32)>,
+    /// The `Colour` element (H.273 code points, HDR mastering and light levels), for video tracks.
+    pub colour: Option<crate::track::Colour>,
 }
 
 impl TrackSpec {
@@ -49,6 +53,8 @@ impl TrackSpec {
             audio: None,
             codec_delay_ns: 0,
             seek_pre_roll_ns: 0,
+            display_size: None,
+            colour: None,
         }
     }
 }
@@ -96,6 +102,39 @@ pub(crate) fn el_uint(out: &mut Vec<u8>, id: u32, v: u64) {
 
 pub(crate) fn el_float(out: &mut Vec<u8>, id: u32, v: f64) {
     el(out, id, &v.to_be_bytes());
+}
+
+/// The body of a `Colour` element: the code points given, then the mastering metadata.
+fn colour_element(c: &crate::track::Colour) -> Vec<u8> {
+    let mut o = Vec::new();
+    for (id, v) in [
+        (MATRIX_COEFFICIENTS, c.matrix_coefficients),
+        (BITS_PER_CHANNEL, c.bits_per_channel),
+        (CHROMA_SUBSAMPLING_HORZ, c.chroma_subsampling_horz),
+        (CHROMA_SUBSAMPLING_VERT, c.chroma_subsampling_vert),
+        (CB_SUBSAMPLING_HORZ, c.cb_subsampling_horz),
+        (CB_SUBSAMPLING_VERT, c.cb_subsampling_vert),
+        (CHROMA_SITING_HORZ, c.chroma_siting_horz),
+        (CHROMA_SITING_VERT, c.chroma_siting_vert),
+        (RANGE, c.range),
+        (TRANSFER_CHARACTERISTICS, c.transfer_characteristics),
+        (PRIMARIES, c.primaries),
+        (MAX_CLL, c.max_cll),
+        (MAX_FALL, c.max_fall),
+    ] {
+        if let Some(v) = v {
+            el_uint(&mut o, id, v);
+        }
+    }
+    if let Some(m) = &c.mastering {
+        let mut d = Vec::new();
+        let [(rx, ry), (gx, gy), (bx, by)] = m.primaries;
+        for (id, v) in [(PRIMARY_R_X, rx), (PRIMARY_R_Y, ry), (PRIMARY_G_X, gx), (PRIMARY_G_Y, gy), (PRIMARY_B_X, bx), (PRIMARY_B_Y, by), (WHITE_POINT_X, m.white_point.0), (WHITE_POINT_Y, m.white_point.1), (LUMINANCE_MAX, m.luminance_max), (LUMINANCE_MIN, m.luminance_min)] {
+            el_float(&mut d, id, v);
+        }
+        el(&mut o, MASTERING_METADATA, &d);
+    }
+    o
 }
 
 pub(crate) fn el_str(out: &mut Vec<u8>, id: u32, s: &str) {
@@ -220,6 +259,13 @@ impl<W: Write + Seek> MkvWriter<W> {
                 let mut v = Vec::new();
                 el_uint(&mut v, PIXEL_WIDTH, pw as u64);
                 el_uint(&mut v, PIXEL_HEIGHT, ph as u64);
+                if let Some((dw, dh)) = t.display_size {
+                    el_uint(&mut v, DISPLAY_WIDTH, dw as u64);
+                    el_uint(&mut v, DISPLAY_HEIGHT, dh as u64);
+                }
+                if let Some(c) = &t.colour {
+                    el(&mut v, COLOUR, &colour_element(c));
+                }
                 el(&mut e, VIDEO, &v);
             }
             if let Some((rate, ch, bits)) = t.audio {
@@ -535,5 +581,34 @@ mod tests {
     #[test]
     fn roundtrip_fixed() {
         roundtrip(LacingMode::FixedOrEbml);
+    }
+
+    /// HDR10 colour (PQ, BT.2020, mastering display, light levels) and an anamorphic display
+    /// size come back as they were written.
+    #[test]
+    fn colour_and_display_size_are_written() {
+        use crate::track::{Colour, MasteringMetadata};
+        let mut v = TrackSpec::new(TrackKind::Video, "V_MPEGH/ISO/HEVC");
+        v.video_size = Some((1440, 1080));
+        v.display_size = Some((1920, 1080));
+        let colour = Colour {
+            matrix_coefficients: Some(9),
+            range: Some(1),
+            transfer_characteristics: Some(16),
+            primaries: Some(9),
+            max_cll: Some(1000),
+            max_fall: Some(400),
+            mastering: Some(MasteringMetadata { primaries: [(0.708, 0.292), (0.17, 0.797), (0.131, 0.046)], white_point: (0.3127, 0.329), luminance_max: 1000.0, luminance_min: 0.0001 }),
+            ..Default::default()
+        };
+        v.colour = Some(colour.clone());
+        let mut m = MkvWriter::new(Cursor::new(Vec::new()), vec![v], MuxOptions::default()).unwrap();
+        m.write_frame(0, 0, true, &[0u8; 8], None).unwrap();
+        let data = m.finish().unwrap().into_inner();
+        let f = crate::open(data).unwrap();
+        let vi = f.tracks[0].video.as_ref().unwrap();
+        assert_eq!((vi.display_width, vi.display_height), (Some(1920), Some(1080)));
+        assert_eq!(vi.pixel_aspect(), (4, 3));
+        assert_eq!(vi.colour.as_ref(), Some(&colour));
     }
 }

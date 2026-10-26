@@ -201,7 +201,8 @@ impl ExrCompression {
 }
 
 /// Audio codec. `Auto` = AAC in MP4 and AAC Audio, PCM in QuickTime / WAV / AIFF, FLAC in FLAC.
-/// MP4 and QuickTime can also carry FLAC; MXF is always PCM.
+/// MP4 and QuickTime can also carry FLAC and Dolby Digital (AC-3, by an encoder registered with
+/// [`crate::register_audio_encoder`]); MXF is always PCM.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AudioCodec {
@@ -211,6 +212,8 @@ pub enum AudioCodec {
     Pcm,
     /// Lossless compression (the FLAC format).
     Flac,
+    /// Dolby Digital (ATSC A/52), from a registered encoder.
+    Ac3,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -558,7 +561,7 @@ impl ExportSettings {
     /// AIFF and QuickTime takes all four, MXF integers only; FLAC integers only; AAC none.
     pub fn supports_sample_format(&self, f: SampleFormat) -> bool {
         match self.audio_codec() {
-            AudioCodec::Aac => false,
+            AudioCodec::Aac | AudioCodec::Ac3 => false,
             AudioCodec::Flac => !f.is_float(),
             AudioCodec::Pcm | AudioCodec::Auto => !(f.is_float() && self.format.is_mxf()),
         }
@@ -572,6 +575,7 @@ impl ExportSettings {
             (Format::Aac, _) => AudioCodec::Aac,
             // MP4 and QuickTime both carry FLAC (`fLaC` + `dfLa`)
             (_, AudioCodec::Flac) => AudioCodec::Flac,
+            (_, AudioCodec::Ac3) => AudioCodec::Ac3,
             (f, _) if f.is_mp4_with(self.multiplexer) => AudioCodec::Aac,
             (_, AudioCodec::Auto) if self.format.is_mp4_video() => AudioCodec::Aac,
             (_, AudioCodec::Auto) => AudioCodec::Pcm,
@@ -641,7 +645,7 @@ impl ExportSettings {
         let audio_bps = if self.has_audio() || self.format.is_audio_only() {
             let pcm = r.sample_rate as f64 * r.channels as f64 * f64::from(self.audio.sample_format().bits());
             match self.audio_codec() {
-                AudioCodec::Aac => self.audio.bitrate_kbps as f64 * 1000.0,
+                AudioCodec::Aac | AudioCodec::Ac3 => self.audio.bitrate_kbps as f64 * 1000.0,
                 // typical of music and dialogue; noise compresses less, silence far more
                 AudioCodec::Flac => pcm * 0.6,
                 _ => pcm,
@@ -740,6 +744,7 @@ impl ExportSettings {
             };
             match self.audio_codec() {
                 AudioCodec::Aac => format!("AAC, {} kbps, {} Hz, {ch}", self.audio.bitrate_kbps, r.sample_rate),
+                AudioCodec::Ac3 => format!("Dolby Digital (AC-3), {} kbps, {} Hz, {ch}", self.audio.bitrate_kbps, r.sample_rate),
                 AudioCodec::Flac => {
                     format!("FLAC (lossless) {}-bit, level {}, {} Hz, {ch}", self.audio.sample_format().bits(), self.audio.flac_level.min(8), r.sample_rate)
                 }
