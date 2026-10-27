@@ -660,7 +660,7 @@ fn box_fixed<T: Copy + Into<u32> + TryFrom<u32> + Send + Sync + Default, const N
             let y1 = (y0 + N).min(h);
             acc.fill(0);
             for line in src[y0 * w..y1 * w].chunks_exact(w) {
-                for (a, block) in acc[..full].iter_mut().zip(line.chunks_exact(N)) {
+                for (a, block) in acc[..full].iter_mut().zip(line.as_chunks::<N>().0) {
                     let mut sum = 0u32;
                     for &v in block {
                         sum += v.into();
