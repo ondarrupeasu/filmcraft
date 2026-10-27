@@ -627,7 +627,79 @@ pub fn default_matrix(width: u32, height: u32) -> Matrix {
 }
 
 /// `n`×`n` box mean of a `w`×`h` plane into `ow`×`oh` (blocks clamped at the right / bottom).
+/// Halving and quartering (a 4K picture shown or sent at 1920 or 960) take a direct path:
+/// [`box_plane_general`] spent 20 ms of processor time on a 4K picture, a task and two buffers
+/// for each output row; this one about a fifth of it, every sample the same.
 fn box_plane<T: Copy + Into<u32> + TryFrom<u32> + Send + Sync + Default>(src: &[T], w: usize, h: usize, ow: usize, oh: usize, n: usize) -> Vec<T> {
+    match n {
+        2 => box_fixed::<T, 2>(src, w, h, ow, oh),
+        4 => box_fixed::<T, 4>(src, w, h, ow, oh),
+        _ => box_plane_general(src, w, h, ow, oh, n),
+    }
+}
+
+/// [`box_plane`] for `N`×`N` blocks: output rows in bands of 16, one accumulator row a band, whole
+/// blocks summed in place and divided by a shift; the blocks the right and bottom edges cut short
+/// by their own count, as [`box_plane_general`] does.
+fn box_fixed<T: Copy + Into<u32> + TryFrom<u32> + Send + Sync + Default, const N: usize>(src: &[T], w: usize, h: usize, ow: usize, oh: usize) -> Vec<T> {
+    const BAND: usize = 16;
+    let mut out = vec![T::default(); ow * oh];
+    if w == 0 || h == 0 || ow == 0 || src.len() < w * h {
+        return out;
+    }
+    // Whole blocks a row has (the rest of the output row: a cut block, then none).
+    let full = (w / N).min(ow);
+    let shift = (N * N).trailing_zeros();
+    out.par_chunks_mut(ow * BAND).enumerate().for_each(|(band, rows)| {
+        let mut acc = vec![0u32; ow];
+        for (r, row) in rows.chunks_mut(ow).enumerate() {
+            let y0 = (band * BAND + r) * N;
+            if y0 >= h {
+                continue;
+            }
+            let y1 = (y0 + N).min(h);
+            acc.fill(0);
+            for line in src[y0 * w..y1 * w].chunks_exact(w) {
+                for (a, block) in acc[..full].iter_mut().zip(line.chunks_exact(N)) {
+                    let mut sum = 0u32;
+                    for &v in block {
+                        sum += v.into();
+                    }
+                    *a += sum;
+                }
+                for (ox, a) in acc.iter_mut().enumerate().skip(full) {
+                    let x0 = ox * N;
+                    if x0 >= w {
+                        break;
+                    }
+                    *a += line[x0..(x0 + N).min(w)].iter().map(|&v| v.into()).sum::<u32>();
+                }
+            }
+            let rows_used = (y1 - y0) as u32;
+            if rows_used as usize == N {
+                for (o, &a) in row[..full].iter_mut().zip(&acc) {
+                    *o = T::try_from((a + (1 << (shift - 1))) >> shift).unwrap_or_default();
+                }
+            } else {
+                let c = N as u32 * rows_used;
+                for (o, &a) in row[..full].iter_mut().zip(&acc) {
+                    *o = T::try_from((a + c / 2) / c).unwrap_or_default();
+                }
+            }
+            for (ox, o) in row.iter_mut().enumerate().skip(full) {
+                let x0 = ox * N;
+                let cols = if x0 >= w { 0 } else { ((x0 + N).min(w) - x0) as u32 };
+                let c = (cols * rows_used).max(1);
+                *o = T::try_from((acc[ox] + c / 2) / c).unwrap_or_default();
+            }
+        }
+    });
+    out
+}
+
+/// `n`×`n` box mean of a `w`×`h` plane into `ow`×`oh`, for any `n` (blocks clamped at the right /
+/// bottom).
+fn box_plane_general<T: Copy + Into<u32> + TryFrom<u32> + Send + Sync + Default>(src: &[T], w: usize, h: usize, ow: usize, oh: usize, n: usize) -> Vec<T> {
     let mut out = vec![T::default(); ow * oh];
     if w == 0 || h == 0 || src.len() < w * h {
         return out;
@@ -711,6 +783,73 @@ fn rotate_chroma<T: Copy + Default + Send + Sync>(planes: &[Arc<Vec<T>>; 3], chr
 
 #[cfg(test)]
 mod tests {
+
+    /// Samples from a little generator (no two runs differ), up to `max`.
+    fn noise<T: TryFrom<u32> + Default>(n: usize, max: u32, seed: u32) -> Vec<T> {
+        let mut x = seed.wrapping_mul(2_654_435_761).max(1);
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                T::try_from(x % (max + 1)).unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// Halving and quartering by the direct path give what the general one gives, sample for
+    /// sample: 8 and 16 bits, even and odd sizes, planes narrower than a block.
+    #[test]
+    fn the_direct_box_path_matches_the_general_one() {
+        let sizes = [(1, 1), (2, 2), (3, 1), (1, 5), (5, 3), (7, 9), (8, 8), (15, 17), (16, 16), (33, 31), (130, 77), (1921, 37)];
+        for (k, &(w, h)) in sizes.iter().enumerate() {
+            for n in [2usize, 4] {
+                // as box_decimated sizes a luma plane, and a 4:2:0 chroma plane of it
+                let (ow, oh) = ((w / n).max(1), (h / n).max(1));
+                let (cw, ch, ocw, och) = (w.div_ceil(2), h.div_ceil(2), ow.div_ceil(2), oh.div_ceil(2));
+                for (pw, ph, pow, poh) in [(w, h, ow, oh), (cw, ch, ocw, och)] {
+                    let a: Vec<u8> = noise(pw * ph, 255, k as u32 * 7 + n as u32);
+                    assert_eq!(super::box_plane(&a, pw, ph, pow, poh, n), super::box_plane_general(&a, pw, ph, pow, poh, n), "u8 {pw}x{ph} /{n}");
+                    for max in [1023u32, 65535] {
+                        let b: Vec<u16> = noise(pw * ph, max, k as u32 * 11 + n as u32 + max);
+                        assert_eq!(super::box_plane(&b, pw, ph, pow, poh, n), super::box_plane_general(&b, pw, ph, pow, poh, n), "u16 <= {max} {pw}x{ph} /{n}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// `box_decimated` by 2 and 4 of 4:2:0, 4:2:2 and 4:4:4 pictures, 8 and 10 bits: each plane
+    /// as the general path makes it.
+    #[test]
+    fn box_decimated_by_two_and_four_is_unchanged() {
+        use super::{Chroma, PixelData, VideoFrame};
+        use std::sync::Arc;
+        for chroma in [Chroma::C420, Chroma::C422, Chroma::C444] {
+            for &(w, h) in &[(64usize, 36usize), (67, 39), (3840 / 8, 2160 / 8)] {
+                for n in [2usize, 4] {
+                    let (sx, sy) = chroma.shifts();
+                    let (cw, ch) = (w.div_ceil(1 << sx), h.div_ceil(1 << sy));
+                    let (ow, oh) = ((w / n).max(1), (h / n).max(1));
+                    let (ocw, och) = (ow.div_ceil(1 << sx), oh.div_ceil(1 << sy));
+                    let p8: [Vec<u8>; 3] = [noise(w * h, 255, 1), noise(cw * ch, 255, 2), noise(cw * ch, 255, 3)];
+                    let f = VideoFrame { width: w as u32, height: h as u32, data: PixelData::Yuv8 { planes: p8.clone().map(Arc::new), chroma, alpha: None }, color: Default::default(), par: (1, 1), pts: Default::default() };
+                    let d = f.box_decimated(n).expect("decimated");
+                    let PixelData::Yuv8 { planes, .. } = &d.data else { panic!("yuv8") };
+                    assert_eq!(*planes[0], super::box_plane_general(&p8[0], w, h, ow, oh, n));
+                    assert_eq!(*planes[1], super::box_plane_general(&p8[1], cw, ch, ocw, och, n));
+                    assert_eq!(*planes[2], super::box_plane_general(&p8[2], cw, ch, ocw, och, n));
+                    let p16: [Vec<u16>; 3] = [noise(w * h, 1023, 4), noise(cw * ch, 1023, 5), noise(cw * ch, 1023, 6)];
+                    let f = VideoFrame { width: w as u32, height: h as u32, data: PixelData::Yuv16 { planes: p16.clone().map(Arc::new), chroma, bits: 10, alpha: None }, color: Default::default(), par: (1, 1), pts: Default::default() };
+                    let d = f.box_decimated(n).expect("decimated");
+                    let PixelData::Yuv16 { planes, .. } = &d.data else { panic!("yuv16") };
+                    assert_eq!(*planes[0], super::box_plane_general(&p16[0], w, h, ow, oh, n), "{chroma:?} {w}x{h} /{n}");
+                    assert_eq!(*planes[1], super::box_plane_general(&p16[1], cw, ch, ocw, och, n));
+                    assert_eq!(*planes[2], super::box_plane_general(&p16[2], cw, ch, ocw, och, n));
+                }
+            }
+        }
+    }
 
     #[test]
     fn cropping_cuts_every_plane_at_the_same_place() {
