@@ -144,9 +144,10 @@ struct State {
     /// Next sample (decode order) to feed, and the sync sample the current run started from.
     next: usize,
     start: usize,
-    /// The pts of that sync sample: what the run outputs shown before it is a leading picture of
-    /// an open GOP, predicted from the GOP before, which a decoder that does not leave those out
-    /// (H.264 at AVCHD's non-IDR I pictures) puts out broken. Not kept.
+    /// The pts of that sync sample when it opens its GOP (`VideoDecoder::closes_gop`): what the
+    /// run outputs shown before it is a leading picture predicted from the GOP before, which a
+    /// decoder that does not leave those out (H.264 at AVCHD's non-IDR I pictures) puts out
+    /// broken. Not kept. `i64::MIN` otherwise.
     start_pts: i64,
     /// Highest pts the running decoder has output since it started (pictures leave in pts order).
     out_max: i64,
@@ -806,7 +807,8 @@ impl GopCache {
             }
             st.next = key;
             st.start = key;
-            st.start_pts = s.pts(key);
+            let open = st.decoder.as_ref().is_some_and(|d| s.read(key).is_ok_and(|data| d.closes_gop(&data) == Some(false)));
+            st.start_pts = if open { s.pts(key) } else { i64::MIN };
             st.out_max = i64::MIN;
         }
         let limit = (i.max(st.next) + 64).min(n);
@@ -1698,6 +1700,9 @@ mod tests {
         }
         fn name(&self) -> &str {
             "broken-leading"
+        }
+        fn closes_gop(&self, _sample: &[u8]) -> Option<bool> {
+            Some(false)
         }
     }
 

@@ -34,6 +34,14 @@ pub trait VideoDecoder: Send {
     fn is_random_access(&self, _sample: &[u8]) -> Option<bool> {
         None
     }
+    /// Whether the pictures decoded after random-access `sample` but shown before it (an open
+    /// GOP's leading pictures) depend on it alone: `Some(true)` (an H.264 IDR: they come out
+    /// whole from a start there), `Some(false)` (an H.264 non-IDR I picture: they are predicted
+    /// from the GOP before, and a start there puts them out broken), `None` when unknown (a
+    /// decoder that leaves broken ones out, as the HEVC decoders do at a CRA).
+    fn closes_gop(&self, _sample: &[u8]) -> Option<bool> {
+        None
+    }
     /// Whether `sample` can be left out without changing any other picture: a non-reference
     /// picture. Decoding forward to a frame while catching up skips such samples when their
     /// frames are late ([`filmcraft_media::cancel::catch_up`]). False when unknown.
@@ -379,6 +387,15 @@ impl VideoDecoder for H264Decoder {
             };
             let mut slices = nals.iter().filter(|n| matches!(ty(n), 1..=4)).peekable();
             nals.iter().any(|n| ty(n) == 7) && nals.iter().any(|n| ty(n) == 8) && slices.peek().is_some() && slices.all(|n| i_slice(n))
+        })
+    }
+    fn closes_gop(&self, sample: &[u8]) -> Option<bool> {
+        // An IDR empties the references: the B pictures after it shown before it (Lumix and
+        // other cameras put two after every IDR) are predicted from it alone.
+        Some(if self.length_size == 0 {
+            filmcraft_bitstream::annexb_nals(sample).iter().any(|n| n.first().is_some_and(|h| h & 0x1f == 5))
+        } else {
+            nal_headers(sample, self.length_size).any(|(h, _)| h & 0x1f == 5)
         })
     }
 }
@@ -1139,6 +1156,9 @@ mod disposable_tests {
         assert_eq!(d.is_random_access(&au(&[sps, pps, i_slice, p_slice])), Some(false));
         assert_eq!(d.is_random_access(&au(&[i_slice])), Some(false), "no parameter sets");
         assert_eq!(d.is_random_access(&au(&[sps, pps, p_slice])), Some(false));
+        // An IDR closes its GOP; a non-IDR I picture opens it.
+        assert_eq!(d.closes_gop(&au(&[sps, pps, idr])), Some(true));
+        assert_eq!(d.closes_gop(&au(&[sps, pps, i_slice])), Some(false));
     }
 
     /// A 4-byte length-prefixed sample of the given NAL units.
