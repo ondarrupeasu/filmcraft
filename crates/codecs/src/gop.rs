@@ -144,6 +144,10 @@ struct State {
     /// Next sample (decode order) to feed, and the sync sample the current run started from.
     next: usize,
     start: usize,
+    /// The pts of that sync sample: what the run outputs shown before it is a leading picture of
+    /// an open GOP, predicted from the GOP before, which a decoder that does not leave those out
+    /// (H.264 at AVCHD's non-IDR I pictures) puts out broken. Not kept.
+    start_pts: i64,
     /// Highest pts the running decoder has output since it started (pictures leave in pts order).
     out_max: i64,
     /// Decoded frames by presentation pts (bounded).
@@ -286,6 +290,26 @@ pub fn set_max_live_decoders(n: usize) -> bool {
     POOL.get().is_none()
 }
 
+/// Each cache's own window, as [`set_cache_window`] leaves it: the frames it always has room
+/// for (default [`MIN_FRAMES`]) and the bytes it holds at most, in use or not (default: no cap).
+static WINDOW_FRAMES: AtomicUsize = AtomicUsize::new(MIN_FRAMES);
+static WINDOW_BYTES: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// Set each cache's window: `max_bytes` of frames at most, even while in use (frames farthest
+/// from the last request go first; the frame asked for and the one just decoded always stay),
+/// with room for `min_frames` whatever their size (default 64: a frame-threaded decoder runs
+/// ahead and playback prefetches; an intra-only stream needs 1 or 2). For applications that skim
+/// one clip at a time: 4K ProRes at 34 MB a frame otherwise keeps 64 frames, 2.2 GB. Only before
+/// the first cache is made: returns whether it was taken.
+pub fn set_cache_window(max_bytes: usize, min_frames: usize) -> bool {
+    if POOL.get().is_some() {
+        return false;
+    }
+    WINDOW_BYTES.store(max_bytes.max(1), Ordering::Relaxed);
+    WINDOW_FRAMES.store(min_frames.max(1), Ordering::Relaxed);
+    POOL.get().is_none()
+}
+
 /// What the caches of a process share: the cap on live decoders and the frame budget.
 struct Pool {
     caches: Mutex<Vec<Weak<Shared>>>,
@@ -300,6 +324,9 @@ struct Pool {
     /// Bytes of the frames the caches hold.
     bytes: AtomicUsize,
     budget: usize,
+    /// Each cache's window: room for this many frames, and at most this many bytes.
+    window_frames: usize,
+    window_bytes: usize,
 }
 
 /// The part of a [`GopCache`] its pool reaches.
@@ -336,7 +363,16 @@ impl Pool {
             hard_decoders: max_decoders,
             bytes: AtomicUsize::new(0),
             budget,
+            window_frames: MIN_FRAMES,
+            window_bytes: usize::MAX,
         }
+    }
+
+    /// Each cache's window (see [`set_cache_window`]).
+    fn windowed(mut self, frames: usize, bytes: usize) -> Self {
+        self.window_frames = frames;
+        self.window_bytes = bytes;
+        self
     }
 
     /// Caches idle for `recent` (< the idle time) are still trimmed, down to `hard_decoders`.
@@ -351,7 +387,11 @@ impl Pool {
         POOL.get_or_init(|| {
             let live = LIVE_DECODERS.load(Ordering::Relaxed);
             // (The defaults: 4 live, 8 for the clips just left.)
-            Arc::new(Pool::new(live, IDLE, BUDGET.load(Ordering::Relaxed)).tiered(RECENT, HARD_DECODERS * live / MAX_LIVE_DECODERS))
+            Arc::new(
+                Pool::new(live, IDLE, BUDGET.load(Ordering::Relaxed))
+                    .tiered(RECENT, HARD_DECODERS * live / MAX_LIVE_DECODERS)
+                    .windowed(WINDOW_FRAMES.load(Ordering::Relaxed), WINDOW_BYTES.load(Ordering::Relaxed)),
+            )
         })
         .clone()
     }
@@ -539,6 +579,7 @@ impl GopCache {
                 spare: Vec::new(),
                 next: usize::MAX,
                 start: 0,
+                start_pts: i64::MIN,
                 out_max: i64::MIN,
                 frames: BTreeMap::new(),
                 drafts: Default::default(),
@@ -594,7 +635,8 @@ impl GopCache {
         } else {
             st.drafts.remove(&pts);
         }
-        let budget = self.budget.max(MIN_FRAMES * f.byte_size());
+        let pool = &self.shared.pool;
+        let budget = self.budget.max(pool.window_frames.saturating_mul(f.byte_size())).min(pool.window_bytes);
         let before = st.bytes;
         st.bytes += f.byte_size();
         if let Some(old) = st.frames.insert(pts, Arc::new(f)) {
@@ -622,7 +664,6 @@ impl GopCache {
                 filmcraft_frame::pool::recycle(v);
             }
         }
-        let pool = &self.shared.pool;
         if st.bytes >= before {
             pool.bytes.fetch_add(st.bytes - before, Ordering::Relaxed);
         } else {
@@ -636,6 +677,10 @@ impl GopCache {
         count_frames(&out);
         for d in out {
             st.out_max = st.out_max.max(d.pts);
+            if d.pts < st.start_pts {
+                filmcraft_frame::pool::recycle(Arc::new(d.frame));
+                continue;
+            }
             self.store(st, d.pts, d.frame, d.draft);
         }
     }
@@ -761,6 +806,7 @@ impl GopCache {
             }
             st.next = key;
             st.start = key;
+            st.start_pts = s.pts(key);
             st.out_max = i64::MIN;
         }
         let limit = (i.max(st.next) + 64).min(n);
@@ -1470,6 +1516,78 @@ mod tests {
         }
     }
 
+    /// A cache's window set by the application (`set_cache_window`): in use, it holds no more
+    /// than its bytes (the frames farthest from the request going first), the frame asked for
+    /// always kept; without it, room for MIN_FRAMES whatever their size.
+    /// As [`Big`], at another size: its planes, recycled, are never the ones
+    /// `evicted_frames_are_decoded_into_again` counts.
+    struct Odd(usize);
+    const ODD: (u32, u32) = (64, 37);
+
+    impl VideoDecoder for Odd {
+        fn decode(&mut self, _sample: &[u8], pts: i64) -> crate::Result<Vec<DecodedFrame>> {
+            let mut px = filmcraft_frame::pool::take_u8((ODD.0 * ODD.1 * 4) as usize);
+            px.resize((ODD.0 * ODD.1 * 4) as usize, (pts / 1000) as u8);
+            Ok(vec![DecodedFrame { pts, frame: VideoFrame::rgba8(ODD.0, ODD.1, px), draft: false }])
+        }
+        fn flush(&mut self) -> Vec<DecodedFrame> {
+            Vec::new()
+        }
+        fn reset(&mut self) {}
+        fn name(&self) -> &str {
+            "odd"
+        }
+    }
+
+    impl VideoSamples for Odd {
+        fn count(&self) -> usize {
+            self.0
+        }
+        fn pts(&self, i: usize) -> i64 {
+            i as i64 * 1000
+        }
+        fn sync_before(&self, _i: usize) -> usize {
+            0
+        }
+        fn sample_at(&self, t: i64) -> Option<usize> {
+            let i = (t / 1000) as usize;
+            (i < self.0).then_some(i)
+        }
+        fn read(&self, i: usize) -> crate::Result<Vec<u8>> {
+            Ok(vec![i as u8])
+        }
+        fn make_decoder(&self) -> crate::Result<Box<dyn VideoDecoder>> {
+            Ok(Box::new(Odd(self.0)))
+        }
+    }
+
+    #[test]
+    fn a_window_caps_a_cache_in_use() {
+        let s = Odd(200);
+        let one = ODD.0 as usize * ODD.1 as usize * 4;
+        let pool = Arc::new(Pool::new(MAX_LIVE_DECODERS, IDLE, FRAME_BUDGET).windowed(2, 5 * one));
+        let mut c = GopCache::in_pool(None, pool.clone());
+        c.budget = 0;
+        for i in 0..40i64 {
+            let f = c.frame(&s, i * 1000).expect("frame");
+            assert_eq!(f.width, ODD.0);
+            let held = c.shared.state.lock().unwrap().bytes;
+            assert!(held <= 5 * one, "frame {i}: {held} bytes held, window {}", 5 * one);
+        }
+        // the last one asked for is there: asked again, no decode
+        let st = c.shared.state.lock().unwrap();
+        assert!(st.frames.contains_key(&39_000), "{:?}", st.frames.keys().collect::<Vec<_>>());
+        assert_eq!(pool.bytes.load(Ordering::Relaxed), st.bytes, "the pool counts what it holds");
+        drop(st);
+        // the default: room for MIN_FRAMES whatever their size
+        let mut d = GopCache::in_pool(None, Arc::new(Pool::new(MAX_LIVE_DECODERS, IDLE, FRAME_BUDGET)));
+        d.budget = 0;
+        for i in 0..(MIN_FRAMES as i64 + 4) {
+            d.frame(&s, i * 1000).expect("frame");
+        }
+        assert_eq!(d.shared.state.lock().unwrap().frames.len(), MIN_FRAMES);
+    }
+
     #[test]
     fn evicted_frames_are_decoded_into_again() {
         let s = Big(200);
@@ -1554,6 +1672,70 @@ mod tests {
         }
         fn make_decoder(&self) -> crate::Result<Box<dyn VideoDecoder>> {
             Ok(Box::new(OpenGopDec { run_start: None, resets: self.resets.clone() }))
+        }
+    }
+
+    /// As [`OpenGop`], with a decoder that puts out the leading pictures of the random-access
+    /// picture a run starts at too, broken (H.264 at AVCHD's non-IDR I pictures): the third byte
+    /// of a broken picture is 1.
+    struct OpenGopAll(OpenGop);
+
+    struct BrokenLeadingDec {
+        run_start: Option<i64>,
+    }
+
+    impl VideoDecoder for BrokenLeadingDec {
+        fn decode(&mut self, _sample: &[u8], pts: i64) -> crate::Result<Vec<DecodedFrame>> {
+            let start = *self.run_start.get_or_insert(pts);
+            let i = (pts / 1000) as u32;
+            Ok(vec![DecodedFrame { pts, frame: VideoFrame::rgba8(1, 1, vec![i as u8, (i >> 8) as u8, u8::from(pts < start), 255]), draft: false }])
+        }
+        fn flush(&mut self) -> Vec<DecodedFrame> {
+            Vec::new()
+        }
+        fn reset(&mut self) {
+            self.run_start = None;
+        }
+        fn name(&self) -> &str {
+            "broken-leading"
+        }
+    }
+
+    impl VideoSamples for OpenGopAll {
+        fn count(&self) -> usize {
+            self.0.count()
+        }
+        fn pts(&self, i: usize) -> i64 {
+            self.0.pts(i)
+        }
+        fn sync_before(&self, i: usize) -> usize {
+            self.0.sync_before(i)
+        }
+        fn sample_at(&self, t: i64) -> Option<usize> {
+            self.0.sample_at(t)
+        }
+        fn read(&self, i: usize) -> crate::Result<Vec<u8>> {
+            self.0.read(i)
+        }
+        fn make_decoder(&self) -> crate::Result<Box<dyn VideoDecoder>> {
+            Ok(Box::new(BrokenLeadingDec { run_start: None }))
+        }
+    }
+
+    /// A run that starts at a random-access picture keeps none of the pictures it puts out that
+    /// are shown before it (leading pictures, predicted from the GOP before): asked for after
+    /// it, a leading picture is decoded from the GOP before, whole, not served broken.
+    #[test]
+    fn leading_pictures_a_run_puts_out_broken_are_not_kept() {
+        let s = OpenGopAll(OpenGop::new(6));
+        let broken = |f: &VideoFrame| matches!(&f.data, filmcraft_frame::PixelData::Rgba8(d) if d[2] == 1);
+        let c = GopCache::new(None);
+        let f = c.frame(&s, 17_000).expect("frame");
+        assert_eq!(index_of(&f), 17);
+        for d in [15usize, 14] {
+            let f = c.frame(&s, d as i64 * 1000).expect("frame");
+            assert_eq!(index_of(&f), d);
+            assert!(!broken(&f), "leading picture {d} served broken");
         }
     }
 

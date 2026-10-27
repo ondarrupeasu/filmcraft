@@ -498,3 +498,25 @@ fn transport_stream_resyncs_after_garbage() {
         }
     }
 }
+
+/// H.264 in TS: an access unit of I slices only is a starting point even when it is not an IDR
+/// (AVCHD writes one IDR, then non-IDR I pictures); one with a P slice is not.
+#[test]
+fn non_idr_intra_pictures_are_keys() {
+    let mut mux = TsMux::new(false);
+    mux.psi(&[(0x1B, 0x1200)]);
+    // IDR, P, non-IDR I (two I slices), P with an I slice first then a P slice
+    let units: [&[u8]; 4] = [
+        &[0, 0, 0, 1, 0x09, 0xF0, 0, 0, 1, 0x65, 0x88, 0x84, 1, 2, 3],
+        &[0, 0, 0, 1, 0x09, 0xF0, 0, 0, 1, 0x41, 0x98, 0x84, 1, 2, 3],
+        // (the second slice: first_mb_in_slice 1, slice_type 7 / 5)
+        &[0, 0, 0, 1, 0x09, 0xF0, 0, 0, 1, 0x41, 0x88, 0x84, 1, 2, 3, 0, 0, 1, 0x41, 0x42, 0x04, 1, 2, 3],
+        &[0, 0, 0, 1, 0x09, 0xF0, 0, 0, 1, 0x41, 0x88, 0x84, 1, 2, 3, 0, 0, 1, 0x41, 0x46, 0x84, 1, 2, 3],
+    ];
+    for (k, u) in units.iter().enumerate() {
+        mux.pes(0x1200, &pes(0xE0, Some(3600 * k as i64), None, u, false));
+    }
+    let f = open(&mux.out).unwrap();
+    let keys: Vec<bool> = f.streams[0].units.iter().map(|u| u.key).collect();
+    assert_eq!(keys, vec![true, false, true, false]);
+}

@@ -364,8 +364,22 @@ impl VideoDecoder for H264Decoder {
         h264_disposable(sample, self.length_size)
     }
     fn is_random_access(&self, sample: &[u8]) -> Option<bool> {
-        // Annex B samples carry their parameter sets: an IDR access unit is a starting point.
-        (self.length_size == 0).then(|| filmcraft_bitstream::annexb_nals(sample).iter().any(|n| n.first().is_some_and(|h| h & 0x1f == 5)))
+        // Annex B samples carry their parameter sets: an IDR access unit is a starting point, and
+        // so is one of I slices only that brings its SPS and PPS (AVCHD's after its first IDR:
+        // without them every seek decoded from the start of the file).
+        (self.length_size == 0).then(|| {
+            let nals = filmcraft_bitstream::annexb_nals(sample);
+            let ty = |n: &&[u8]| n.first().map_or(0, |h| h & 0x1f);
+            if nals.iter().any(|n| ty(n) == 5) {
+                return true;
+            }
+            let i_slice = |n: &[u8]| {
+                let mut r = filmcraft_bitstream::BitReader::new(n.get(1..).unwrap_or_default());
+                r.read_ue().is_ok() && r.read_ue().is_ok_and(|t| t % 5 == 2)
+            };
+            let mut slices = nals.iter().filter(|n| matches!(ty(n), 1..=4)).peekable();
+            nals.iter().any(|n| ty(n) == 7) && nals.iter().any(|n| ty(n) == 8) && slices.peek().is_some() && slices.all(|n| i_slice(n))
+        })
     }
 }
 
@@ -1108,6 +1122,24 @@ pub fn mpeg2_factory(e: &SampleEntry) -> Option<Result<Box<dyn VideoDecoder>>> {
 #[cfg(test)]
 mod disposable_tests {
     use super::{h264_disposable, hevc_disposable};
+
+    /// Annex B H.264 starting points: an IDR access unit, or one of I slices only that brings
+    /// its SPS and PPS (AVCHD's after its first IDR); not one with a P slice, nor I slices
+    /// without their parameter sets.
+    #[test]
+    fn h264_random_access_points_in_annex_b() {
+        use super::VideoDecoder;
+        let d = super::H264Decoder::annexb();
+        let au = |nals: &[&[u8]]| nals.iter().flat_map(|n| [&[0u8, 0, 0, 1][..], n].concat()).collect::<Vec<u8>>();
+        let (sps, pps): (&[u8], &[u8]) = (&[0x67, 0x64, 0, 0x28, 0xAC], &[0x68, 0xEE, 0x3C, 0x80]);
+        // first_mb_in_slice 0, slice_type 7 (I) / 5 (P)
+        let (i_slice, p_slice, idr): (&[u8], &[u8], &[u8]) = (&[0x41, 0x88, 0x84], &[0x41, 0x98, 0x84], &[0x65, 0x88, 0x84]);
+        assert_eq!(d.is_random_access(&au(&[idr])), Some(true));
+        assert_eq!(d.is_random_access(&au(&[sps, pps, i_slice, i_slice])), Some(true));
+        assert_eq!(d.is_random_access(&au(&[sps, pps, i_slice, p_slice])), Some(false));
+        assert_eq!(d.is_random_access(&au(&[i_slice])), Some(false), "no parameter sets");
+        assert_eq!(d.is_random_access(&au(&[sps, pps, p_slice])), Some(false));
+    }
 
     /// A 4-byte length-prefixed sample of the given NAL units.
     fn sample(nals: &[&[u8]]) -> Vec<u8> {

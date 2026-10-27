@@ -65,6 +65,9 @@ struct Open {
     disposable: bool,
     /// A coded slice has been seen (H.264 / HEVC).
     vcl: bool,
+    /// H.264: every slice so far is an I slice (a non-IDR picture a decoder can start from, as
+    /// AVCHD writes them after its first IDR: without them every seek decoded from the start).
+    intra: bool,
     picture: Option<PictureInfo>,
 }
 
@@ -359,7 +362,7 @@ impl Splitter {
         let at = self.es_pos;
         self.close(at);
         // the chunk of this position arrives with the next feed: resolved there
-        let mut o = Open { start: at, pos: u64::MAX, offset: 0, pts: None, dts: None, key: false, disposable: false, vcl: false, picture: None };
+        let mut o = Open { start: at, pos: u64::MAX, offset: 0, pts: None, dts: None, key: false, disposable: false, vcl: false, intra: false, picture: None };
         if let Some((pts, dts)) = self.timestamps_at(at) {
             o.pts = pts;
             o.dts = dts;
@@ -397,7 +400,7 @@ impl Splitter {
             return;
         }
         let size = (end - o.start).min(u32::MAX as u64) as u32;
-        self.units.push(Unit { pts: o.pts, dts: o.dts, key: o.key, disposable: o.disposable, size, pos: o.pos, offset: o.offset, picture: o.picture });
+        self.units.push(Unit { pts: o.pts, dts: o.dts, key: o.key || o.intra, disposable: o.disposable, size, pos: o.pos, offset: o.offset, picture: o.picture });
     }
 
     /// Payload bytes of one chunk (`pos`: where the reader restarts to find them).
@@ -470,8 +473,8 @@ impl Splitter {
         let mut i = 0;
         let mut blocked = None;
         while let Some(k) = self.next_start_code(i) {
-            // NAL header byte(s) needed
-            if k + 5 > self.buf.len() {
+            // NAL header byte(s) needed (a non-IDR H.264 slice's: the slice header's first fields too)
+            if k + 5 > self.buf.len() || (!hevc && matches!(self.buf[k + 3] & 0x1F, 1..=4) && k + 9 > self.buf.len()) {
                 blocked = Some(k);
                 break;
             }
@@ -488,10 +491,13 @@ impl Splitter {
                 let t = h & 0x1F;
                 (t == 5, (1..=5).contains(&t), h & 0x60 == 0)
             };
+            // An H.264 slice of a non-IDR picture: is it an I slice?
+            let i_slice = !hevc && matches!(h & 0x1F, 1..=4) && slice_type(&self.buf[k + 4..(k + 9).min(self.buf.len())]).is_some_and(|t| t % 5 == 2);
             if let Some(o) = self.open.as_mut()
                 && vcl
             {
                 o.key |= key;
+                o.intra = if o.vcl { o.intra && i_slice } else { i_slice };
                 // disposable while every slice is non-reference
                 o.disposable = if o.vcl { o.disposable && non_ref } else { non_ref };
                 o.vcl = true;
@@ -591,6 +597,7 @@ impl Splitter {
             key: matches!(pp.info.coding_type, 1 | 4),
             disposable: pp.info.coding_type == 3,
             vcl: true,
+            intra: false,
             picture: Some(pp.info),
         };
         if let Some((pts, dts)) = self.timestamps_at(pp.at) {
@@ -628,7 +635,7 @@ impl Splitter {
                     if !(sync == AudioSync::Ac3 && self.open.is_some() && eac3_joins_unit(&self.buf[i..])) {
                         self.close(at);
                         let (pos, offset) = self.locate(at).unwrap_or((u64::MAX, 0));
-                        let mut o = Open { start: at, pos, offset, pts: None, dts: None, key: true, disposable: false, vcl: false, picture: None };
+                        let mut o = Open { start: at, pos, offset, pts: None, dts: None, key: true, disposable: false, vcl: false, intra: false, picture: None };
                         if let Some((pts, dts)) = self.timestamps_at(at) {
                             o.pts = pts;
                             o.dts = dts;
@@ -691,6 +698,30 @@ impl Splitter {
         }
         self.close(end);
     }
+}
+
+/// An H.264 slice header's `slice_type` (after `first_mb_in_slice`), from its first bytes.
+fn slice_type(b: &[u8]) -> Option<u32> {
+    let mut bit = 0usize;
+    let mut ue = || -> Option<u32> {
+        let mut zeros = 0;
+        while (b.get(bit / 8)? >> (7 - bit % 8)) & 1 == 0 {
+            zeros += 1;
+            bit += 1;
+            if zeros > 16 {
+                return None;
+            }
+        }
+        bit += 1;
+        let mut v = 0u32;
+        for _ in 0..zeros {
+            v = (v << 1) | u32::from((b.get(bit / 8)? >> (7 - bit % 8)) & 1);
+            bit += 1;
+        }
+        Some((1 << zeros) - 1 + v)
+    };
+    ue()?;
+    ue()
 }
 
 #[cfg(test)]
