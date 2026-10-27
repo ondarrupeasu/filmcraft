@@ -259,6 +259,33 @@ const HARD_DECODERS: usize = 8;
 /// nobody was looking at.
 pub const FRAME_BUDGET: usize = 1 << 30;
 
+/// The process's frame budget and live-decoder cap, as [`set_frame_budget`] and
+/// [`set_max_live_decoders`] leave them (the defaults otherwise).
+static BUDGET: AtomicUsize = AtomicUsize::new(FRAME_BUDGET);
+static LIVE_DECODERS: AtomicUsize = AtomicUsize::new(MAX_LIVE_DECODERS);
+static POOL: std::sync::OnceLock<Arc<Pool>> = std::sync::OnceLock::new();
+
+/// Set the bytes of decoded frames all caches of the process may hold together (default
+/// [`FRAME_BUDGET`], 1 GiB): an application that only skims or shows one clip at a time can keep
+/// its memory far lower. Only before the first cache is made: returns whether it was taken.
+pub fn set_frame_budget(bytes: usize) -> bool {
+    if POOL.get().is_some() {
+        return false;
+    }
+    BUDGET.store(bytes.max(1), Ordering::Relaxed);
+    POOL.get().is_none()
+}
+
+/// Set how many caches keep their decoder once idle (default 4; caches left moments ago keep
+/// up to twice as many). Only before the first cache is made: returns whether it was taken.
+pub fn set_max_live_decoders(n: usize) -> bool {
+    if POOL.get().is_some() {
+        return false;
+    }
+    LIVE_DECODERS.store(n.max(1), Ordering::Relaxed);
+    POOL.get().is_none()
+}
+
 /// What the caches of a process share: the cap on live decoders and the frame budget.
 struct Pool {
     caches: Mutex<Vec<Weak<Shared>>>,
@@ -321,8 +348,12 @@ impl Pool {
 
     /// The pool of every cache in the process.
     fn global() -> Arc<Pool> {
-        static POOL: std::sync::OnceLock<Arc<Pool>> = std::sync::OnceLock::new();
-        POOL.get_or_init(|| Arc::new(Pool::new(MAX_LIVE_DECODERS, IDLE, FRAME_BUDGET).tiered(RECENT, HARD_DECODERS))).clone()
+        POOL.get_or_init(|| {
+            let live = LIVE_DECODERS.load(Ordering::Relaxed);
+            // (The defaults: 4 live, 8 for the clips just left.)
+            Arc::new(Pool::new(live, IDLE, BUDGET.load(Ordering::Relaxed)).tiered(RECENT, HARD_DECODERS * live / MAX_LIVE_DECODERS))
+        })
+        .clone()
     }
 
     fn register(&self, c: &Arc<Shared>) {
@@ -867,6 +898,23 @@ impl GopCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The frame budget and live-decoder cap an application sets before the first cache: the
+    /// process's pool is made with them, and later calls are refused.
+    #[test]
+    fn the_pool_takes_the_budget_set_before_it() {
+        if POOL.get().is_some() {
+            return;
+        }
+        assert!(set_frame_budget(256 << 20));
+        assert!(set_max_live_decoders(2));
+        let p = Pool::global();
+        assert_eq!((p.budget, p.max_decoders, p.hard_decoders), (256 << 20, 2, 4));
+        assert!(!set_frame_budget(1 << 30), "too late once the pool is made");
+        assert!(!set_max_live_decoders(8));
+        assert_eq!(Pool::global().budget, 256 << 20);
+    }
+
     use crate::video::DecodedFrame;
     use std::collections::VecDeque;
 
