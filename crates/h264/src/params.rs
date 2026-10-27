@@ -516,8 +516,10 @@ impl Sps {
     }
 
     pub fn check_supported(&self) -> Result<()> {
-        if !self.frame_mbs_only {
-            return unsupported("interlaced (field / MBAFF) coding");
+        // Interlaced streams whose every picture is a frame (no MBAFF; field pictures are
+        // refused slice by slice) decode as frames do: AVCHD 1080i as many cameras write it.
+        if !self.frame_mbs_only && self.mb_adaptive_frame_field {
+            return unsupported("interlaced MBAFF coding");
         }
         if self.chroma_array_type() != 1 {
             return unsupported(format!("chroma_format_idc {} (only 4:2:0 is implemented)", self.chroma_format_idc));
@@ -677,6 +679,20 @@ impl Pps {
 mod tests {
     use super::*;
     use filmcraft_bitstream::BitWriter;
+
+    /// An AVCHD 1080i camera's SPS (High@4.0, frame_mbs_only_flag 0 without MBAFF): every picture
+    /// a frame, so it decodes as frames do; 1920x1080 once cropped from 1088.
+    #[test]
+    fn interlaced_frame_coding_without_mbaff_is_supported() {
+        let nal: Vec<u8> = (0..48).map(|i| u8::from_str_radix(&"27640028ad002db01e0111f7808800000300080000030197260000a4cb800107ad078c19300005265c00083d683c6050"[i * 2..i * 2 + 2], 16).unwrap()).collect();
+        let sps = Sps::parse(&filmcraft_bitstream::unescape_rbsp(&nal[1..])).expect("parses");
+        assert!(!sps.frame_mbs_only && !sps.mb_adaptive_frame_field);
+        assert!(sps.check_supported().is_ok());
+        let (_, _, w, h) = sps.crop_rect();
+        assert_eq!((w, h), (1920, 1080));
+        let mbaff = Sps { mb_adaptive_frame_field: true, ..sps };
+        assert!(mbaff.check_supported().unwrap_err().to_string().contains("MBAFF"));
+    }
 
     #[test]
     fn scaling_list_default_signal() {
