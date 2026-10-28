@@ -627,20 +627,22 @@ pub fn default_matrix(width: u32, height: u32) -> Matrix {
 }
 
 /// `n`×`n` box mean of a `w`×`h` plane into `ow`×`oh` (blocks clamped at the right / bottom).
-/// Halving and quartering (a 4K picture shown or sent at 1920 or 960) take a direct path:
+/// Halving, thirding and quartering (a 4K picture shown or sent at 1920, MontageR's viewer, 960)
+/// take a direct path:
 /// [`box_plane_general`] spent 20 ms of processor time on a 4K picture, a task and two buffers
 /// for each output row; this one about a fifth of it, every sample the same.
 fn box_plane<T: Copy + Into<u32> + TryFrom<u32> + Send + Sync + Default>(src: &[T], w: usize, h: usize, ow: usize, oh: usize, n: usize) -> Vec<T> {
     match n {
         2 => box_fixed::<T, 2>(src, w, h, ow, oh),
+        3 => box_fixed::<T, 3>(src, w, h, ow, oh),
         4 => box_fixed::<T, 4>(src, w, h, ow, oh),
         _ => box_plane_general(src, w, h, ow, oh, n),
     }
 }
 
 /// [`box_plane`] for `N`×`N` blocks: output rows in bands of 16, one accumulator row a band, whole
-/// blocks summed in place and divided by a shift; the blocks the right and bottom edges cut short
-/// by their own count, as [`box_plane_general`] does.
+/// blocks summed in place (divided by a shift when `N`×`N` is a power of 2); the blocks the right
+/// and bottom edges cut short by their own count, as [`box_plane_general`] does.
 fn box_fixed<T: Copy + Into<u32> + TryFrom<u32> + Send + Sync + Default, const N: usize>(src: &[T], w: usize, h: usize, ow: usize, oh: usize) -> Vec<T> {
     const BAND: usize = 16;
     let mut out = vec![T::default(); ow * oh];
@@ -676,7 +678,7 @@ fn box_fixed<T: Copy + Into<u32> + TryFrom<u32> + Send + Sync + Default, const N
                 }
             }
             let rows_used = (y1 - y0) as u32;
-            if rows_used as usize == N {
+            if rows_used as usize == N && (N * N).is_power_of_two() {
                 for (o, &a) in row[..full].iter_mut().zip(&acc) {
                     *o = T::try_from((a + (1 << (shift - 1))) >> shift).unwrap_or_default();
                 }
@@ -797,13 +799,13 @@ mod tests {
             .collect()
     }
 
-    /// Halving and quartering by the direct path give what the general one gives, sample for
+    /// Halving, thirding and quartering by the direct path give what the general one gives, sample for
     /// sample: 8 and 16 bits, even and odd sizes, planes narrower than a block.
     #[test]
     fn the_direct_box_path_matches_the_general_one() {
         let sizes = [(1, 1), (2, 2), (3, 1), (1, 5), (5, 3), (7, 9), (8, 8), (15, 17), (16, 16), (33, 31), (130, 77), (1921, 37)];
         for (k, &(w, h)) in sizes.iter().enumerate() {
-            for n in [2usize, 4] {
+            for n in [2usize, 3, 4] {
                 // as box_decimated sizes a luma plane, and a 4:2:0 chroma plane of it
                 let (ow, oh) = ((w / n).max(1), (h / n).max(1));
                 let (cw, ch, ocw, och) = (w.div_ceil(2), h.div_ceil(2), ow.div_ceil(2), oh.div_ceil(2));
@@ -819,15 +821,15 @@ mod tests {
         }
     }
 
-    /// `box_decimated` by 2 and 4 of 4:2:0, 4:2:2 and 4:4:4 pictures, 8 and 10 bits: each plane
+    /// `box_decimated` by 2, 3 and 4 of 4:2:0, 4:2:2 and 4:4:4 pictures, 8 and 10 bits: each plane
     /// as the general path makes it.
     #[test]
-    fn box_decimated_by_two_and_four_is_unchanged() {
+    fn box_decimated_by_two_three_and_four_is_unchanged() {
         use super::{Chroma, PixelData, VideoFrame};
         use std::sync::Arc;
         for chroma in [Chroma::C420, Chroma::C422, Chroma::C444] {
             for &(w, h) in &[(64usize, 36usize), (67, 39), (3840 / 8, 2160 / 8)] {
-                for n in [2usize, 4] {
+                for n in [2usize, 3, 4] {
                     let (sx, sy) = chroma.shifts();
                     let (cw, ch) = (w.div_ceil(1 << sx), h.div_ceil(1 << sy));
                     let (ow, oh) = ((w / n).max(1), (h / n).max(1));
