@@ -2207,6 +2207,7 @@ dependencies = [
  "filmcraft-isobmff",
  "filmcraft-media",
  "filmcraft-project",
+ "filmcraft-prores",
  "filmcraft-render",
  "filmcraft-testkit",
  "filmcraft-time",

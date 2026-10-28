@@ -22,12 +22,53 @@ const LOG_MAX_BYTES: usize = 256 << 20;
 /// Presentation times remembered as returned (older ones are forgotten first).
 const EMITTED_MAX: usize = 4096;
 
+/// What the hybrid knows of its stream: a NAL or frame stream's restart points and in-band
+/// parameters, or an intra stream (ProRes: every sample a picture of its own, nothing in-band to
+/// change).
+enum Info {
+    Stream(StreamInfo),
+    Intra,
+}
+
+impl Info {
+    fn is_irap(&self, sample: &[u8]) -> bool {
+        match self {
+            Self::Stream(i) => i.is_irap(sample),
+            Self::Intra => true,
+        }
+    }
+    fn keeps_previous_restart(&self, sample: &[u8]) -> bool {
+        match self {
+            Self::Stream(i) => i.keeps_previous_restart(sample),
+            Self::Intra => false,
+        }
+    }
+    fn parameters_changed(&self, sample: &[u8]) -> bool {
+        match self {
+            Self::Stream(i) => i.parameters_changed(sample),
+            Self::Intra => false,
+        }
+    }
+    fn is_random_access(&self, sample: &[u8]) -> Option<bool> {
+        match self {
+            Self::Stream(i) => i.is_random_access(sample),
+            Self::Intra => Some(true),
+        }
+    }
+    fn is_disposable(&self, sample: &[u8]) -> bool {
+        match self {
+            Self::Stream(i) => i.is_disposable(sample),
+            Self::Intra => false,
+        }
+    }
+}
+
 /// A hardware decoder with a transparent software fallback.
 pub struct HybridDecoder {
     hw: Option<Box<dyn VideoDecoder>>,
     sw: Option<Box<dyn VideoDecoder>>,
     entry: SampleEntry,
-    info: StreamInfo,
+    info: Info,
     draft: bool,
     /// Samples (and pts) since the last restart point; `None` once the bound was passed.
     log: Option<Vec<(Vec<u8>, i64)>>,
@@ -43,7 +84,15 @@ pub struct HybridDecoder {
 impl HybridDecoder {
     /// Wrap `hw`, a decoder for `entry` (whose stream is described by `info`).
     pub fn new(hw: Box<dyn VideoDecoder>, entry: SampleEntry, info: impl Into<StreamInfo>) -> Self {
-        let info = info.into();
+        Self::with_info(hw, entry, Info::Stream(info.into()))
+    }
+
+    /// Wrap `hw`, a decoder for intra-only `entry` (ProRes): every sample a restart point.
+    pub fn intra(hw: Box<dyn VideoDecoder>, entry: SampleEntry) -> Self {
+        Self::with_info(hw, entry, Info::Intra)
+    }
+
+    fn with_info(hw: Box<dyn VideoDecoder>, entry: SampleEntry, info: Info) -> Self {
         filmcraft_codecs::hw::note_hw_session();
         Self {
             hw: Some(hw),

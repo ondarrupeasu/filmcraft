@@ -197,6 +197,18 @@ pub fn videotoolbox_factory(entry: &filmcraft_isobmff::SampleEntry) -> Option<fi
     if !filmcraft_codecs::hw::hardware_decoding() {
         return None;
     }
+    // ProRes 422 on a Mac with a ProRes engine (the Rust decoder takes over if it fails)
+    if let filmcraft_isobmff::CodecConfig::ProRes { fourcc } = &entry.codec {
+        let (w, h) = entry.video.as_ref().map_or((0, 0), |v| (u32::from(v.width), u32::from(v.height)));
+        return match videotoolbox::VtProRes::new(fourcc.0, w, h) {
+            Ok(vt) => Some(Ok(Box::new(HybridDecoder::intra(Box::new(vt), entry.clone())))),
+            Err(why) => {
+                log::info!("hardware decoding declined for ProRes video: {why}");
+                filmcraft_codecs::hw::note_hw_declined();
+                None
+            }
+        };
+    }
     let info = filmcraft_codecs::hw::NalStreamInfo::from_entry(entry)?.ok()?;
     match videotoolbox::VtDecoder::new(info.clone()) {
         Ok(vt) => Some(Ok(Box::new(HybridDecoder::new(Box::new(vt), entry.clone(), info)))),

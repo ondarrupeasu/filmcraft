@@ -1,4 +1,5 @@
-//! VideoToolbox (macOS) hardware H.264 / HEVC decoding.
+//! VideoToolbox (macOS) hardware H.264 / HEVC decoding, and ProRes 422 on the Macs with a ProRes
+//! engine (Apple silicon Pro / Max / Ultra and later; [`VtProRes`]).
 //!
 //! The only module of the workspace with `unsafe` code besides the other FFI modules of this crate
 //! (docs/adr/0001-platform-ffi.md). Rules: every `unsafe` block has a `// SAFETY:` comment; no
@@ -25,8 +26,8 @@ use filmcraft_codecs::{CodecError, DecodedFrame, Result, VideoDecoder};
 use filmcraft_frame::{Chroma, PixelData, VideoFrame, pool};
 use objc2_core_foundation::{CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType};
 use objc2_core_media::{
-    CMBlockBuffer, CMFormatDescription, CMSampleBuffer, CMSampleTimingInfo, CMTime, CMTimeFlags, CMVideoFormatDescriptionCreateFromH264ParameterSets,
-    CMVideoFormatDescriptionCreateFromHEVCParameterSets, kCMBlockBufferAssureMemoryNowFlag,
+    CMBlockBuffer, CMFormatDescription, CMSampleBuffer, CMSampleTimingInfo, CMTime, CMTimeFlags, CMVideoFormatDescriptionCreate,
+    CMVideoFormatDescriptionCreateFromH264ParameterSets, CMVideoFormatDescriptionCreateFromHEVCParameterSets, kCMBlockBufferAssureMemoryNowFlag,
 };
 use objc2_core_video::{
     CVImageBuffer, CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetHeight, CVPixelBufferGetHeightOfPlane,
@@ -277,7 +278,11 @@ fn layout(info: &NalStreamInfo) -> std::result::Result<Layout, String> {
 
 impl Session {
     fn new(info: &NalStreamInfo, layout: Layout) -> std::result::Result<Session, String> {
-        let format = format_description(info)?;
+        Self::with_format(format_description(info)?, layout)
+    }
+
+    /// A hardware session for `format`, decoding into `layout`.
+    fn with_format(format: CFRetained<CMFormatDescription>, layout: Layout) -> std::result::Result<Session, String> {
         // SAFETY: reading an immutable framework constant.
         let key: &CFString = unsafe { kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder };
         let spec = CFDictionary::<CFString, CFType>::from_slices(&[key], &[CFBoolean::new(true).as_ref()]);
@@ -401,6 +406,117 @@ fn sample_buffer(sample: &[u8], pts: i64, format: &CMFormatDescription) -> std::
     let out = NonNull::new(out).filter(|_| status == 0).ok_or_else(|| format!("CMSampleBufferCreateReady failed ({status})"))?;
     // SAFETY: created retained (+1).
     Ok(unsafe { CFRetained::from_raw(out) })
+}
+
+/// ProRes 422 (`apco`, `apcs`, `apcn`, `apch`) through the Mac's ProRes engine: a picture per
+/// sample, decoded by the hardware and copied out as 10-bit 4:2:2 (Apple's decoder and ours differ
+/// by at most 1 in a sample here and there, as ProRes leaves its IDCT's rounding to the decoder).
+/// About a tenth of the processor time of FilmCraft's ProRes in Rust (4K HQ: 5.6 against 74 ms a
+/// frame on an M3 Pro). 4444 and XQ (alpha) are left to the Rust decoder.
+pub struct VtProRes {
+    layout: Layout,
+    session: Session,
+    /// Samples submitted whose picture has not been taken yet.
+    in_flight: usize,
+    /// The stream's colour, from its first frame header (as FilmCraft's decoder reads it).
+    color: Option<filmcraft_color::ColorInfo>,
+}
+
+/// The ProRes 422 sample entry formats VideoToolbox's hardware decodes here.
+const PRORES_422: [[u8; 4]; 4] = [*b"apco", *b"apcs", *b"apcn", *b"apch"];
+
+impl VtProRes {
+    /// A decoder for a ProRes 422 stream of `width`×`height`, or why VideoToolbox does not take it
+    /// (another ProRes, no ProRes engine, session creation failed).
+    pub fn new(fourcc: [u8; 4], width: u32, height: u32) -> std::result::Result<Self, String> {
+        if !PRORES_422.contains(&fourcc) {
+            return Err(format!("ProRes {} is left to the software decoder", String::from_utf8_lossy(&fourcc)));
+        }
+        let codec = u32::from_be_bytes(fourcc);
+        // SAFETY: a pure query with no pointer arguments.
+        if !unsafe { objc2_video_toolbox::VTIsHardwareDecodeSupported(codec) } {
+            return Err("no ProRes engine".into());
+        }
+        if width == 0 || height == 0 || width > 16384 || height > 16384 {
+            return Err(format!("picture size {width}x{height}"));
+        }
+        let mut out: *const CMFormatDescription = std::ptr::null();
+        // SAFETY: plain values and an out pointer to a local; CoreMedia returns the description
+        // retained (+1).
+        let status = unsafe { CMVideoFormatDescriptionCreate(None, codec, width as i32, height as i32, None, NonNull::from(&mut out)) };
+        let fd = NonNull::new(out as *mut CMFormatDescription).filter(|_| status == 0).ok_or_else(|| format!("CMVideoFormatDescriptionCreate failed ({status})"))?;
+        // SAFETY: a "Create" function returns the description retained (+1); `CFRetained` takes it over.
+        let format = unsafe { CFRetained::from_raw(fd) };
+        let layout = Layout { pixel_format: P210_VIDEO, coded: (width, height), crop: (0, 0, width, height), chroma: Chroma::C422, bits: 10, color: filmcraft_color::ColorInfo::REC709, par: (1, 1) };
+        // Made now, so a stream the engine cannot take is declined up front.
+        let session = Session::with_format(format, layout.clone())?;
+        Ok(Self { layout, session, in_flight: 0, color: None })
+    }
+
+    /// The pictures the callback has, in order, with the stream's colour.
+    fn take(&mut self) -> Result<Vec<DecodedFrame>> {
+        let mut out = Vec::new();
+        for o in self.session.take() {
+            self.in_flight = self.in_flight.saturating_sub(1);
+            match o {
+                Output::Frame(mut f) => {
+                    f.frame.color = self.color.unwrap_or(self.layout.color);
+                    out.push(f);
+                }
+                Output::Failed(e) => return Err(CodecError::Decode(e)),
+            }
+        }
+        out.sort_by_key(|f| f.pts);
+        Ok(out)
+    }
+}
+
+impl VideoDecoder for VtProRes {
+    fn decode(&mut self, sample: &[u8], pts: i64) -> Result<Vec<DecodedFrame>> {
+        if self.color.is_none() {
+            // as FilmCraft's decoder: Rec. 709, with the frame header's matrix and transfer
+            let mut c = filmcraft_color::ColorInfo::REC709;
+            if let Ok((h, ..)) = filmcraft_prores::FrameHeader::parse(sample) {
+                if let Some(m) = filmcraft_color::Matrix::from_code(h.color.matrix) {
+                    c.matrix = m;
+                }
+                if let Some(t) = filmcraft_color::Transfer::from_code(h.color.transfer) {
+                    c.transfer = t;
+                }
+            }
+            self.color = Some(c);
+        }
+        self.session.submit(sample, pts).map_err(CodecError::Decode)?;
+        self.in_flight += 1;
+        if self.in_flight > MAX_IN_FLIGHT {
+            self.session.wait();
+        }
+        self.take()
+    }
+
+    fn flush(&mut self) -> Vec<DecodedFrame> {
+        self.session.wait();
+        self.take().unwrap_or_else(|e| {
+            log::warn!("VideoToolbox ProRes: {e} while flushing");
+            Vec::new()
+        })
+    }
+
+    fn reset(&mut self) {
+        // Every picture stands alone: the session stays (making one costs ~90 ms, a seek nothing),
+        // only what it still holds is dropped.
+        self.session.wait();
+        drop(self.session.take());
+        self.in_flight = 0;
+    }
+
+    fn name(&self) -> &str {
+        "VideoToolbox ProRes"
+    }
+
+    fn is_random_access(&self, _sample: &[u8]) -> Option<bool> {
+        Some(true)
+    }
 }
 
 /// Whether VideoToolbox reports a hardware decoder for the codec at all.

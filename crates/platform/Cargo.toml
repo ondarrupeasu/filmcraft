@@ -33,6 +33,8 @@ filmcraft-time = { workspace = true }
 log = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# ProRes through VideoToolbox: its frame header (the stream's colour)
+filmcraft-prores = { workspace = true }
 objc2-core-foundation = "0.3.2"
 objc2-core-media = "0.3.2"
 objc2-core-video = "0.3.2"
